@@ -1,0 +1,15 @@
+{
+  "name": "vexis-key-store",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VEXIS — Free Fire Key Store พร้อมระบบหลังบ้าน เติมเงินซองทรู/ธนาคาร และระบบยศ",
+  "scripts": {
+    "dev": "wrangler dev --ip 0.0.0.0 --port 3000 --local --persist-to .wrangler/state",
+    "start": "wrangler dev --ip 0.0.0.0 --port 3000 --local --persist-to .wrangler/state",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

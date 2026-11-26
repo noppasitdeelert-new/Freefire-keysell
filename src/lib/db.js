@@ -1,0 +1,454 @@
+import { hashPassword, randomHex } from './security.js';
+
+export const ROLES = {
+  owner: { rank: 1, label: 'Owner' },
+  admin: { rank: 2, label: 'Admin' },
+  dealer: { rank: 3, label: 'ตัวแทน/ตัวขาย' },
+  member: { rank: 4, label: 'Member' },
+};
+
+export const BRAND = 'VEXIS';
+export const BRAND_FULL = 'VEXIS KEY STORE';
+export const DEALER_DISCOUNT = 0.35; // ตัวแทนซื้อถูกลง 35%
+export const FEE_PERCENT = 3; // หักค่าธรรมเนียม 3%
+export const TICKET_PHONE = '0805894742'; // เบอร์รับซองทรู (ล็อกถาวร) — แสดงเฉพาะผู้ที่เข้าสู่ระบบแล้วเท่านั้น ห้ามแสดงสาธารณะ
+export const DISCORD_URL = 'https://discord.gg/2ZNazcaDbY'; // ชุมชน Discord อย่างเป็นทางการ
+export const RESELLER_FEE = 30; // ค่าบริการตัวแทนรายเดือน
+export const RESELLER_WEEKLY_TARGET = 250; // ยอดขายขั้นต่ำต่อสัปดาห์
+export const RESELLER_MONTHLY_TARGET = 650; // ยอดขายขั้นต่ำต่อเดือน
+export const RESELLER_TRIAL_DAYS = 30; // รอบประเมินตัวแทน (ถ้าไม่ถึงเป้าจะถูกปลด)
+
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    balance REAL NOT NULL DEFAULT 0,
+    is_root INTEGER NOT NULL DEFAULT 0,
+    display_name TEXT NOT NULL DEFAULT '',
+    contact TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_login_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price REAL NOT NULL,
+    stock INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    product_name TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price REAL NOT NULL,
+    total REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS topups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    amount REAL NOT NULL,
+    fee REAL NOT NULL,
+    net REAL NOT NULL,
+    reference TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    review_note TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    reply TEXT NOT NULL DEFAULT '',
+    replied_by INTEGER,
+    replied_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS captchas (
+    id TEXT PRIMARY KEY,
+    answer TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS stock_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available',
+    order_id INTEGER,
+    sold_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS reseller_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    contact TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
+    fee_paid_until TEXT,
+    review_note TEXT NOT NULL DEFAULT '',
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT 'API key',
+    token_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL DEFAULT '',
+    last_used_at TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS ip_bans (
+    ip TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 1,
+    banned_until INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL DEFAULT 'percent',
+    value REAL NOT NULL DEFAULT 0,
+    max_uses INTEGER NOT NULL DEFAULT 0,
+    per_user_limit INTEGER NOT NULL DEFAULT 1,
+    min_spend REAL NOT NULL DEFAULT 0,
+    product_id INTEGER,
+    category_id INTEGER,
+    starts_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS coupon_usages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    coupon_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    order_id INTEGER,
+    code TEXT NOT NULL DEFAULT '',
+    discount REAL NOT NULL DEFAULT 0,
+    subtotal REAL NOT NULL DEFAULT 0,
+    total REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_items_code ON stock_items (product_id, code)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_coupons_code ON coupons (code)`,
+  `CREATE INDEX IF NOT EXISTS idx_coupon_usages_coupon ON coupon_usages (coupon_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_coupon_usages_user ON coupon_usages (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_stock_items_ready ON stock_items (product_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items (order_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ip_bans_until ON ip_bans (banned_until)`,
+  `CREATE INDEX IF NOT EXISTS idx_reseller_status ON reseller_profiles (status)`,
+  `CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys (user_id)`, 
+  `CREATE INDEX IF NOT EXISTS idx_products_category ON products (category_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_user ON orders (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_topups_user ON topups (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_topups_status ON topups (status)`,
+  `CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets (user_id)`,
+];
+
+const SEED_SETTINGS = [
+  ['store_name', BRAND_FULL],
+  ['store_tagline', 'คีย์ฟีฟายพรีเมียม ส่งไว 24 ชม. โดย VEXIS'],
+  ['bank_name', 'ธนาคารกสิกรไทย'],
+  ['bank_account', '080-5-894-742'],
+  ['bank_holder', 'ร้าน VEXIS KEY STORE'],
+  ['topup_note', 'โอนแล้วแนบสลิป/เลขอ้างอิง ระบบจะหักค่าธรรมเนียม 3% จากยอดที่ได้รับ'],
+];
+
+/** สินค้าหลักของแบรนด์ VEXIS — เพิ่มแบบไม่ทับข้อมูลเดิมและไม่แตะสต็อก/ยอดเงิน */
+export const DEFAULT_CATALOG = [
+  {
+    category: 'Phantom',
+    name: 'PHANTOM KEY',
+    description: 'คีย์ Phantom สำหรับ Free Fire ปลดล็อกฟีเจอร์ครบชุด ส่งคีย์อัตโนมัติทันทีหลังชำระเงิน',
+    duration: '30 วัน',
+    price: 299,
+  },
+  {
+    category: 'Rezzx mods',
+    name: 'REZZX MOD KEY',
+    description: 'คีย์ Rezzx Mod อัปเดตไว ใช้งานได้ทั้งมือถือและอีมูเลเตอร์',
+    duration: '30 วัน',
+    price: 249,
+  },
+  {
+    category: 'Aimhack',
+    name: 'AIMHACK KEY',
+    description: 'คีย์ Aimhack พร้อมระบบช่วยเล็ง ปรับแต่งค่าได้ละเอียด',
+    duration: '30 วัน',
+    price: 349,
+  },
+];
+
+const SEED_PRODUCTS = DEFAULT_CATALOG.map((item) => [
+  item.category,
+  item.name,
+  item.description,
+  item.price,
+  0,
+  item.duration,
+]);
+
+let initPromise = null;
+
+/** คีย์ตัวอย่าง DEMO-... ห้ามถูกนับเป็นสต็อกและห้ามถูกส่งขายให้ลูกค้าเด็ดขาด */
+export const DEMO_PREFIX = 'DEMO-';
+
+/** ทำให้จำนวนสต็อกของสินค้าตรงกับจำนวนคีย์จริงที่พร้อมขาย */
+export async function syncStock(db, productId) {
+  await db
+    .prepare(
+      `UPDATE products SET stock =
+         (SELECT COUNT(*) FROM stock_items
+          WHERE product_id = ? AND status = 'available' AND code NOT LIKE 'DEMO-%')
+       WHERE id = ?`,
+    )
+    .bind(productId, productId)
+    .run();
+}
+
+async function seed(db) {
+  for (const [key, value] of SEED_SETTINGS) {
+    await db
+      .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+      .bind(key, value)
+      .run();
+  }
+
+  const root = await db.prepare('SELECT id FROM users WHERE is_root = 1 LIMIT 1').first();
+  if (!root) {
+    const salt = randomHex(16);
+    const hash = await hashPassword('2235', salt);
+    await db
+      .prepare(
+        `INSERT INTO users (username, password_hash, salt, role, balance, is_root, display_name)
+         VALUES ('New', ?, ?, 'owner', 0, 1, 'New (Owner สูงสุด)')
+         ON CONFLICT(username) DO NOTHING`,
+      )
+      .bind(hash, salt)
+      .run();
+  }
+
+  const categoryCount = await db.prepare('SELECT COUNT(*) AS total FROM categories').first();
+  if (Number(categoryCount?.total || 0) === 0) {
+    const names = [...new Set(SEED_PRODUCTS.map((p) => p[0]))];
+    for (let i = 0; i < names.length; i += 1) {
+      await db
+        .prepare('INSERT INTO categories (name, description, sort_order) VALUES (?, ?, ?)')
+        .bind(names[i], 'หมวดหมู่ ' + names[i], i + 1)
+        .run();
+    }
+    const cats = await db.prepare('SELECT id, name FROM categories').all();
+    const byName = new Map(cats.results.map((c) => [c.name, c.id]));
+    for (const [cat, name, description, price, stock, duration] of SEED_PRODUCTS) {
+      await db
+        .prepare(
+          'INSERT INTO products (category_id, name, description, price, stock, duration) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .bind(byName.get(cat), name, description, price, stock, duration)
+        .run();
+    }
+  }
+}
+
+/** เพิ่มคอลัมน์ใหม่แบบไม่ทำลายข้อมูลเดิม (ใช้กับฐานข้อมูลที่สร้างไว้ก่อนหน้า) */
+async function addColumnIfMissing(db, table, column, ddl) {
+  const info = await db.prepare(`PRAGMA table_info(${table})`).all();
+  if (info.results.some((row) => row.name === column)) return;
+  await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${ddl}`).run();
+}
+
+/**
+ * อัปเกรดแบรนด์เป็น VEXIS — เปลี่ยนเฉพาะค่าที่ยังเป็นค่าเริ่มต้นเดิมของร้าน
+ * ค่าที่แอดมินแก้เองแล้วจะไม่ถูกแตะ และไม่มีการลบข้อมูลใด ๆ
+ */
+async function migrateBrand(db) {
+  const done = await db.prepare("SELECT value FROM settings WHERE key = 'brand_v2'").first();
+  if (done) return;
+  await db.batch([
+    db
+      .prepare("UPDATE settings SET value = ? WHERE key = 'store_name' AND value = 'FIREKEY STORE'")
+      .bind(BRAND_FULL),
+    db
+      .prepare(
+        "UPDATE settings SET value = ? WHERE key = 'store_tagline' AND value = 'คีย์ฟีฟายราคาส่ง ส่งไว 24 ชม.'",
+      )
+      .bind('คีย์ฟีฟายพรีเมียม ส่งไว 24 ชม. โดย VEXIS'),
+    db
+      .prepare("UPDATE settings SET value = ? WHERE key = 'bank_holder' AND value = 'ร้าน FIREKEY STORE'")
+      .bind('ร้าน VEXIS KEY STORE'),
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('brand_v2', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ),
+  ]);
+}
+
+/**
+ * เปลี่ยนชื่อร้านที่แสดงในระบบเป็น VEXIS ให้ครบทุกจุด (ทำครั้งเดียว)
+ * แตะเฉพาะค่า settings ไม่ยุ่งกับคีย์/ยอดเงิน/ประวัติการซื้อ
+ */
+async function migrateBrandV3(db) {
+  const done = await db.prepare("SELECT value FROM settings WHERE key = 'brand_v3'").first();
+  if (done) return;
+  await db.batch([
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'store_name'").bind(BRAND_FULL),
+    db
+      .prepare("UPDATE settings SET value = ? WHERE key = 'store_tagline' AND value LIKE '%FIREKEY%'")
+      .bind('คีย์ฟีฟายพรีเมียม ส่งไว 24 ชม. โดย VEXIS'),
+    db
+      .prepare("UPDATE settings SET value = ? WHERE key = 'bank_holder' AND value LIKE '%FIREKEY%'")
+      .bind('ร้าน VEXIS KEY STORE'),
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('brand_v3', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ),
+  ]);
+}
+
+/**
+ * เพิ่มสินค้าหลักของแบรนด์ให้ฐานข้อมูลเดิม (ทำครั้งเดียว)
+ * - ไม่แก้ราคา/สต็อกของสินค้าที่มีอยู่แล้ว
+ * - ไม่ลบหรือรีเซ็ตคีย์/ยอดเงิน/ประวัติใด ๆ
+ */
+async function migrateCatalog(db) {
+  const done = await db.prepare("SELECT value FROM settings WHERE key = 'catalog_v2'").first();
+  if (done) return;
+
+  const maxOrder = await db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS v FROM categories').first();
+  let sort = Number(maxOrder?.v || 0);
+
+  for (const item of DEFAULT_CATALOG) {
+    let category = await db
+      .prepare('SELECT id FROM categories WHERE name = ? COLLATE NOCASE')
+      .bind(item.category)
+      .first();
+    if (!category) {
+      sort += 1;
+      const created = await db
+        .prepare('INSERT INTO categories (name, description, sort_order) VALUES (?, ?, ?)')
+        .bind(item.category, 'หมวดหมู่ ' + item.category, sort)
+        .run();
+      category = { id: created.meta.last_row_id };
+    }
+
+    const exists = await db
+      .prepare('SELECT id FROM products WHERE name = ? COLLATE NOCASE')
+      .bind(item.name)
+      .first();
+    if (exists) continue;
+
+    await db
+      .prepare(
+        'INSERT INTO products (category_id, name, description, price, stock, duration) VALUES (?, ?, ?, ?, 0, ?)',
+      )
+      .bind(category.id, item.name, item.description, item.price, item.duration)
+      .run();
+  }
+
+  await db
+    .prepare("INSERT INTO settings (key, value) VALUES ('catalog_v2', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run();
+}
+
+export function initDb(env) {
+  if (!initPromise) {
+    initPromise = (async () => {
+      const db = env.DB;
+      await db.batch(SCHEMA.map((sql) => db.prepare(sql)));
+      // รองรับระยะเวลาการใช้งานของสินค้าในฐานข้อมูลเดิม โดยไม่รีเซ็ตข้อมูล
+      await addColumnIfMissing(db, 'products', 'duration', "duration TEXT NOT NULL DEFAULT ''");
+      // token กันการกดซื้อซ้ำ (ไม่กระทบออเดอร์เดิมเพราะค่าเริ่มต้นเป็นค่าว่าง)
+      await addColumnIfMissing(db, 'orders', 'client_token', "client_token TEXT NOT NULL DEFAULT ''");
+      // ส่วนลดคูปองที่ใช้กับออเดอร์ (ออเดอร์เดิมได้ค่าเริ่มต้นเป็น 0)
+      await addColumnIfMissing(db, 'orders', 'coupon_code', "coupon_code TEXT NOT NULL DEFAULT ''");
+      await addColumnIfMissing(db, 'orders', 'discount', 'discount REAL NOT NULL DEFAULT 0');
+      await seed(db);
+      await migrateBrand(db);
+      await migrateBrandV3(db);
+      await migrateCatalog(db);
+
+      // คีย์ตัวอย่าง DEMO- ของเดิม → แยกสถานะ 'demo' เพื่อไม่ให้ถูกนับเป็นสต็อกหรือถูกส่งขาย
+      await db
+        .prepare("UPDATE stock_items SET status = 'demo' WHERE code LIKE 'DEMO-%' AND status <> 'sold'")
+        .run();
+
+      // จำนวนสต็อกที่แสดงต้องตรงกับคีย์จริงที่พร้อมขายเสมอ
+      await db
+        .prepare(
+          `UPDATE products SET stock =
+             (SELECT COUNT(*) FROM stock_items
+              WHERE product_id = products.id AND status = 'available' AND code NOT LIKE 'DEMO-%')`,
+        )
+        .run();
+
+      const now = Date.now();
+      await db.batch([
+        db.prepare('DELETE FROM captchas WHERE expires_at < ?').bind(now - 60 * 60 * 1000),
+        db.prepare('DELETE FROM ip_bans WHERE banned_until < ?').bind(now - 7 * 24 * 60 * 60 * 1000),
+        db.prepare('DELETE FROM rate_limits WHERE reset_at < ?').bind(now - 60 * 60 * 1000),
+      ]);
+    })().catch((err) => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  return initPromise;
+}
+
+export async function audit(db, actor, action, detail) {
+  await db
+    .prepare('INSERT INTO audit_logs (actor_id, actor_name, action, detail) VALUES (?, ?, ?, ?)')
+    .bind(actor ? actor.id : null, actor ? actor.username : 'system', action, String(detail || '').slice(0, 400))
+    .run();
+}
