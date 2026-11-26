@@ -24,6 +24,17 @@ const BAN_CACHE_MS = 30_000;
 const MAX_URL_LENGTH = 2048;
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 
+/**
+ * เส้นทางที่หน้าเว็บเรียกซ้ำเองเป็นระยะ (polling สถานะเรียลไทม์)
+ * แยกโควตาออกจากการท่องเว็บปกติ และไม่สะสมโทษแบน
+ * เพื่อไม่ให้ผู้ใช้จริงที่เปิดหลายแท็บ/หลายอุปกรณ์ถูกแบนจนเว็บใช้งานไม่ได้
+ */
+const POLL_PATHS = new Set(['/api/live']);
+const POLL_BURST_WINDOW_MS = 5_000;
+const POLL_BURST_LIMIT = 60;
+const POLL_WINDOW_MS = 60_000;
+const POLL_WINDOW_LIMIT = 300;
+
 const buckets = new Map();
 const banCache = new Map();
 
@@ -47,10 +58,18 @@ function track(ip) {
       sweep();
       if (buckets.size >= MAX_TRACKED_IPS) buckets.clear();
     }
-    entry = { hits: [], violations: [], last: 0 };
+    entry = { hits: [], pollHits: [], violations: [], last: 0 };
     buckets.set(ip, entry);
   }
   return entry;
+}
+
+function pathnameOf(url) {
+  try {
+    return new URL(String(url || ''), 'https://local.invalid').pathname;
+  } catch {
+    return '';
+  }
 }
 
 function countRecent(hits, cutoff) {
@@ -120,9 +139,19 @@ export async function guardRequest({ db, ip, method, url }) {
 
   const entry = track(ip);
   entry.last = now;
+  prune(entry.violations, now - VIOLATION_WINDOW_MS);
+
+  // polling ของหน้าเว็บ: แยกโควตา ไม่นับเป็นการยิงถี่ และไม่นำไปสู่การแบน IP
+  if (POLL_PATHS.has(pathnameOf(url))) {
+    prune(entry.pollHits, now - POLL_WINDOW_MS);
+    entry.pollHits.push(now);
+    const pollBurst = countRecent(entry.pollHits, now - POLL_BURST_WINDOW_MS);
+    if (pollBurst <= POLL_BURST_LIMIT && entry.pollHits.length <= POLL_WINDOW_LIMIT) return;
+    throw new HttpError(429, 'ระบบกำลังอัปเดตข้อมูล กรุณารอสักครู่แล้วลองใหม่', { retryAfter: 5 });
+  }
+
   prune(entry.hits, now - WINDOW_MS);
   entry.hits.push(now);
-  prune(entry.violations, now - VIOLATION_WINDOW_MS);
 
   const burst = countRecent(entry.hits, now - BURST_WINDOW_MS);
   if (burst <= BURST_LIMIT && entry.hits.length <= WINDOW_LIMIT) return;

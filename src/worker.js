@@ -29,6 +29,7 @@ import {
   audit,
   syncStock,
   ROLES,
+  STAFF_ROLES,
   BRAND,
   BRAND_FULL,
   DEALER_DISCOUNT,
@@ -41,13 +42,20 @@ import {
   RESELLER_TRIAL_DAYS,
 } from './lib/db.js';
 import { guardRequest, securitySummary } from './lib/guard.js';
+import { requirePermission, permissionsFor } from './lib/perms.js';
+import { awardSignupReward, awardFirstPurchaseReward, findReferrerByCode, normalizeReferralCode } from './lib/referral.js';
+import { sendEmail, emailConfig } from './lib/email.js';
+import { recordFraud } from './lib/fraud.js';
+import { toSatang, fromSatang, splitFee, thb } from './lib/money.js';
+import { createUltimate } from './ultimate.js';
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
 const ROLE_KEYS = Object.keys(ROLES);
-const STAFF_RANK = ROLES.admin.rank;
+const STAFF_SET = new Set(STAFF_ROLES);
+const STAFF_RANK = ROLES.support.rank;
 const DEALER_RATE = 1 - DEALER_DISCOUNT;
 
 function roleRank(role) {
@@ -73,6 +81,10 @@ function publicUser(user) {
     roleLabel: ROLES[user.role]?.label || user.role,
     rank: roleRank(user.role),
     balance: money(user.balance),
+    points: Number(user.points || 0),
+    locale: user.locale || 'th',
+    email: user.email || '',
+    restricted: Number(user.restricted) === 1,
     isRoot: Number(user.is_root) === 1,
     contact: user.contact,
     createdAt: user.created_at,
@@ -84,9 +96,19 @@ function requireUser(ctx) {
   return ctx.user;
 }
 
-function requireStaff(ctx) {
+async function requireStaff(ctx) {
   const user = requireUser(ctx);
-  if (roleRank(user.role) > STAFF_RANK) throw new HttpError(403, 'เฉพาะแอดมินขึ้นไปเท่านั้น');
+  if (!STAFF_SET.has(user.role)) {
+    await recordFraud(ctx.db, {
+      userId: user.id,
+      type: 'admin_unauthorized',
+      risk: 'high',
+      description: `ผู้ใช้ ${user.username} (${user.role}) พยายามเรียก Admin API ${ctx.url ? ctx.url.pathname : ''}`,
+      evidence: { path: ctx.url ? ctx.url.pathname : '', role: user.role },
+      ip: ctx.ip || '',
+    });
+    throw new HttpError(403, 'เฉพาะทีมงานเท่านั้น');
+  }
   return user;
 }
 
@@ -278,6 +300,47 @@ async function logStaff(ctx, action, detail) {
   await audit(ctx.env.DB, ctx.user, action, detail);
 }
 
+/**
+ * บันทึกธุรกรรมกระเป๋า + ปรับยอดแบบ atomic
+ * - idempotency_key เป็น UNIQUE → ซ้ำไม่ได้ แม้เรียกพร้อมกัน
+ * - คำนวณเป็นสตางค์ทั้งหมด (ไม่มีความคลาดเคลื่อนจาก floating-point)
+ */
+async function creditWallet(db, { userId, amountSatang, kind, refType = '', refId = null, note = '', idempotencyKey, actorId = null }) {
+  const satang = Math.round(Number(amountSatang) || 0);
+  if (satang <= 0) throw new HttpError(400, 'ยอดเครดิตไม่ถูกต้อง');
+  const amount = fromSatang(satang);
+  const user = await db.prepare('SELECT balance FROM users WHERE id = ?').bind(userId).first();
+  if (!user) throw new HttpError(404, 'ไม่พบผู้ใช้');
+  const before = fromSatang(toSatang(user.balance));
+  const after = fromSatang(toSatang(user.balance) + satang);
+
+  let txId = null;
+  try {
+    const inserted = await db
+      .prepare(
+        `INSERT INTO wallet_transactions
+           (user_id, kind, amount, balance_before, balance_after, ref_type, ref_id, note, idempotency_key, actor_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(userId, kind, amount, before, after, refType, refId, String(note).slice(0, 200), idempotencyKey, actorId)
+      .run();
+    txId = inserted.meta.last_row_id;
+  } catch {
+    // idempotency ซ้ำ → ไม่เพิ่มเครดิตซ้ำ
+    return { credited: false, duplicate: true, balance: before };
+  }
+
+  const updated = await db
+    .prepare('UPDATE users SET balance = ROUND(balance + ?, 2) WHERE id = ?')
+    .bind(amount, userId)
+    .run();
+  if (Number(updated.meta.changes) !== 1) {
+    await db.prepare('DELETE FROM wallet_transactions WHERE id = ?').bind(txId).run();
+    throw new HttpError(500, 'อัปเดตยอดเครดิตไม่สำเร็จ กรุณาลองใหม่');
+  }
+  return { credited: true, txId, amount, before, after };
+}
+
 /* ------------------------------------------------------------------ */
 /* public routes                                                       */
 /* ------------------------------------------------------------------ */
@@ -297,7 +360,13 @@ async function health(ctx) {
 }
 
 async function getConfig(ctx) {
-  const settings = await getSettings(ctx.env.DB);
+  // หน้าเว็บต้องเปิดได้เสมอ แม้ฐานข้อมูลสะดุดชั่วคราว
+  let settings = {};
+  try {
+    settings = await getSettings(ctx.env.DB);
+  } catch {
+    settings = {};
+  }
   // ข้อมูลรับเงิน (เบอร์รับซอง/บัญชีธนาคาร) แสดงเฉพาะผู้ที่เข้าสู่ระบบแล้วเท่านั้น
   const viewer = ctx.user;
   return json({
@@ -317,6 +386,9 @@ async function getConfig(ctx) {
     turnstileSiteKey: ctx.env.TURNSTILE_SITE_KEY || '',
     roles: ROLE_KEYS.map((key) => ({ key, label: ROLES[key].label, rank: ROLES[key].rank })),
     dealerDiscount: Math.round(DEALER_DISCOUNT * 100),
+    maintenance: settings.maintenance_mode === '1',
+    maintenanceMessage: settings.maintenance_mode === '1' ? settings.maintenance_message || '' : '',
+    emailConfigured: emailConfig(ctx.env).configured,
   });
 }
 
@@ -400,6 +472,9 @@ async function register(ctx) {
   await enforceRate(db, `register:name:${username.toLowerCase()}`, 3, 10 * 60 * 1000);
   const password = str(body.password, { label: 'รหัสผ่าน', min: 6, max: 72 });
   const contact = str(body.contact, { label: 'ช่องทางติดต่อ', max: 60, required: false });
+  const email = str(body.email, { label: 'อีเมล', max: 120, required: false });
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new HttpError(400, 'รูปแบบอีเมลไม่ถูกต้อง');
+  const rawRef = normalizeReferralCode(str(body.ref, { label: 'รหัสเชิญ', max: 16, required: false }));
 
   const exists = await db
     .prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE')
@@ -407,20 +482,79 @@ async function register(ctx) {
     .first();
   if (exists) throw new HttpError(409, 'ชื่อผู้ใช้นี้ถูกใช้งานแล้ว');
 
+  const referrer = rawRef ? await findReferrerByCode(db, rawRef) : null;
+  if (rawRef && !referrer) throw new HttpError(400, 'รหัสเชิญไม่ถูกต้องหรือหมดอายุ');
+
   const salt = randomHex(16);
   const hash = await hashPassword(password, salt);
   const result = await db
     .prepare(
-      `INSERT INTO users (username, password_hash, salt, role, balance, display_name, contact)
-       VALUES (?, ?, ?, 'member', 0, ?, ?)`,
+      `INSERT INTO users (username, password_hash, salt, role, balance, display_name, contact, email, referred_by)
+       VALUES (?, ?, ?, 'member', 0, ?, ?, ?, ?)`,
     )
-    .bind(username, hash, salt, username, contact)
+    .bind(username, hash, salt, username, contact, email, referrer ? referrer.user_id : null)
     .run();
 
   const user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(result.meta.last_row_id).first();
   const session = await startSession(ctx, user, isSecureRequest(request));
   await audit(db, user, 'register', `สมัครสมาชิกใหม่ (${username})`);
-  return json({ user: publicUser(user) }, 201, { 'set-cookie': session.cookie });
+
+  // Referral: ให้รางวัลผู้เชิญ (ตรวจฝั่งเซิร์ฟเวอร์ทั้งหมด)
+  if (referrer) {
+    const reward = await awardSignupReward(db, {
+      refereeId: user.id,
+      refereeUsername: user.username,
+      referrerId: referrer.user_id,
+      code: referrer.code,
+      ip,
+    });
+    if (reward) {
+      await audit(db, null, 'referral.signup', `#${referrer.user_id} ได้รางวัล ${reward.amount} (${reward.unit}) จาก ${username}`);
+    }
+    // Fraud: IP เดียวสร้าง referral ผิดปกติ
+    const sameIp = await db
+      .prepare(
+        "SELECT COUNT(*) AS total FROM referral_transactions WHERE ip = ? AND created_at >= datetime('now', '-24 hours')",
+      )
+      .bind(ip)
+      .first();
+    if (Number(sameIp?.total || 0) >= 3) {
+      await recordFraud(db, {
+        userId: user.id,
+        type: 'referral_same_ip',
+        risk: 'medium',
+        description: `มี referral จาก IP ${ip} จำนวน ${sameIp.total} ครั้งใน 24 ชั่วโมง`,
+        evidence: { ip, count: sameIp.total, referrer: referrer.user_id },
+        ip,
+      });
+    }
+  }
+
+  // Fraud: สมัครถี่ผิดปกติจากระบบทั้งหมด
+  const recentSignups = await db
+    .prepare("SELECT COUNT(*) AS total FROM users WHERE created_at >= datetime('now', '-10 minutes')")
+    .first();
+  if (Number(recentSignups?.total || 0) >= 15) {
+    await recordFraud(db, {
+      userId: user.id,
+      type: 'signup_velocity',
+      risk: 'medium',
+      description: `สมัคร ${recentSignups.total} บัญชีใน 10 นาที`,
+      evidence: { count: recentSignups.total, ip },
+      ip,
+    });
+  }
+
+  if (email) {
+    await sendEmail(ctx.env, db, {
+      userId: user.id,
+      to: email,
+      event: 'signup',
+      vars: { username: user.username },
+    });
+  }
+
+  return json({ user: publicUser(user), referralApplied: Boolean(referrer) }, 201, { 'set-cookie': session.cookie });
 }
 
 async function login(ctx) {
@@ -441,9 +575,35 @@ async function login(ctx) {
   if (!user) throw invalid;
 
   const hash = await hashPassword(password, user.salt);
-  if (!safeEqual(hash, user.password_hash)) throw invalid;
+  if (!safeEqual(hash, user.password_hash)) {
+    // Fraud: เข้าสู่ระบบผิดพลาดซ้ำ
+    await audit(db, { id: null, username: 'system' }, 'auth.fail', `ล็อกอินผิด: ${username} จาก ${ip}`);
+    const fails = await db
+      .prepare(
+        "SELECT COUNT(*) AS total FROM audit_logs WHERE action = 'auth.fail' AND detail LIKE ? AND created_at >= datetime('now', '-15 minutes')",
+      )
+      .bind(`%${username}%`)
+      .first();
+    if (Number(fails?.total || 0) >= 5) {
+      await recordFraud(db, {
+        userId: user.id,
+        type: 'login_failures',
+        risk: 'high',
+        description: `เข้าสู่ระบบผิดพลาด ${fails.total} ครั้งใน 15 นาที (บัญชี ${username})`,
+        evidence: { attempts: fails.total, ip },
+        ip,
+      });
+    }
+    throw invalid;
+  }
+  if (Number(user.restricted) === 1) {
+    throw new HttpError(403, `บัญชีนี้ถูกระงับ: ${user.restriction_reason || 'กรุณาติดต่อซัพพอร์ต'}`);
+  }
 
-  await db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").bind(user.id).run();
+  await db
+    .prepare("UPDATE users SET last_login_at = datetime('now'), online_at = datetime('now') WHERE id = ?")
+    .bind(user.id)
+    .run();
   const session = await startSession(ctx, user, isSecureRequest(request));
   return json({ user: publicUser(user) }, 200, { 'set-cookie': session.cookie });
 }
@@ -459,7 +619,15 @@ async function getMe(ctx) {
     await evaluateReseller(ctx.env.DB, user);
     if (before === 'dealer') user = await ctx.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
   }
-  return json({ user: publicUser(user), pricing: { role: user ? user.role : 'guest' } });
+  let permissions = [];
+  if (user && STAFF_SET.has(user.role)) {
+    permissions = [...(await permissionsFor(ctx.env.DB, user))];
+  }
+  return json({
+    user: publicUser(user),
+    permissions,
+    pricing: { role: user ? user.role : 'guest' },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -553,11 +721,14 @@ async function releaseStock(db, ids) {
  * ซื้อสินค้า: ตัดเครดิต + ส่งคีย์จากสต็อกอัตโนมัติทันที
  * ลำดับ: จองคีย์ → หักเงิน → บันทึกออเดอร์ → ผูกคีย์กับออเดอร์ (ผิดพลาดที่ขั้นไหนคืนคีย์ให้)
  */
-async function purchaseKeys(db, user, productId, quantity, clientToken = '', couponCode = '') {
+async function purchaseKeys(db, env, user, productId, quantity, clientToken = '', couponCode = '') {
   const product = await db.prepare('SELECT * FROM products WHERE id = ?').bind(productId).first();
   if (!product || Number(product.active) !== 1) throw new HttpError(404, 'ไม่พบสินค้านี้');
 
   const freshUser = await db.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
+  if (Number(freshUser.restricted) === 1) {
+    throw new HttpError(403, `บัญชีนี้ถูกระงับการทำธุรกรรม: ${freshUser.restriction_reason || 'กรุณาติดต่อซัพพอร์ต'}`);
+  }
   const unitPrice = priceFor(product, freshUser.role);
   const subtotal = money(unitPrice * quantity);
   let total = subtotal;
@@ -682,6 +853,74 @@ async function purchaseKeys(db, user, productId, quantity, clientToken = '', cou
   ]);
   await syncStock(db, productId);
 
+  // Wallet Ledger — บันทึกการหักเครดิต (idempotency กันบันทึกซ้ำเมื่อ retry)
+  try {
+    const bal = await db.prepare('SELECT balance FROM users WHERE id = ?').bind(user.id).first();
+    const current = fromSatang(toSatang(bal?.balance || 0));
+    await db
+      .prepare(
+        `INSERT INTO wallet_transactions
+           (user_id, kind, amount, balance_before, balance_after, ref_type, ref_id, note, idempotency_key)
+         VALUES (?, 'purchase', ?, ?, ?, 'order', ?, ?, ?)`,
+      )
+      .bind(
+        user.id,
+        -total,
+        fromSatang(toSatang(current) + toSatang(total)),
+        current,
+        orderId,
+        `ซื้อ ${product.name} × ${quantity}`,
+        `order:${orderId}`,
+      )
+      .run();
+  } catch {
+    /* การบันทึก ledger ซ้ำต้องไม่ทำให้คำสั่งซื้อล้มเหลว */
+  }
+
+  // Order Tracking — บันทึกประวัติทุกขั้น (ใช้เวลาจริง ณ ตอนเกิดเหตุ)
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  await db.batch([
+    db
+      .prepare("INSERT INTO order_status_history (order_id, status, note, actor_name, created_at) VALUES (?, 'created', ?, 'system', ?)")
+      .bind(orderId, 'สร้างคำสั่งซื้อโดยสมาชิก', now),
+    db
+      .prepare("INSERT INTO order_status_history (order_id, status, note, actor_name, created_at) VALUES (?, 'paid', ?, 'system', ?)")
+      .bind(orderId, `หักเครดิตกระเป๋า ฿${total}`, now),
+    db
+      .prepare("INSERT INTO order_status_history (order_id, status, note, actor_name, created_at) VALUES (?, 'processing', ?, 'system', ?)")
+      .bind(orderId, 'จองคีย์จากคลังสำเร็จ', now),
+    db
+      .prepare("INSERT INTO order_status_history (order_id, status, note, actor_name, created_at) VALUES (?, 'key_assigned', ?, 'system', ?)")
+      .bind(orderId, `มอบคีย์ ${picked.length} รายการ`, now),
+    db
+      .prepare("INSERT INTO order_status_history (order_id, status, note, actor_name, created_at) VALUES (?, 'delivered', ?, 'system', ?)")
+      .bind(orderId, 'ส่งมอบคีย์ให้สมาชิกแล้ว', now),
+  ]);
+
+  if (freshUser.email && emailConfig(env).configured) {
+    const codes = picked.map((row) => row.code).join('\n');
+    await sendEmail(env, db, {
+      userId: user.id,
+      to: freshUser.email,
+      event: 'order_paid',
+      vars: { orderId, total, product: product.name },
+    });
+    await sendEmail(env, db, {
+      userId: user.id,
+      to: freshUser.email,
+      event: 'key_delivered',
+      vars: { orderId, codes },
+    });
+  }
+
+  // Referral: รางวัลเพื่อนซื้อครั้งแรก (ให้ครั้งเดียวต่อผู้ถูกเชิญ)
+  await awardFirstPurchaseReward(db, {
+    buyerId: user.id,
+    buyerUsername: freshUser.username,
+    orderId,
+    ip: '',
+  });
+
   const updated = await db.prepare('SELECT balance FROM users WHERE id = ?').bind(user.id).first();
   return {
     order: {
@@ -723,7 +962,22 @@ async function createOrder(ctx) {
       .first();
     if (used) throw new HttpError(409, 'คำสั่งซื้อนี้ถูกบันทึกไปแล้ว กรุณาตรวจสอบประวัติการซื้อ');
   }
-  const result = await purchaseKeys(db, user, productId, quantity, clientToken, couponCode);
+  // Fraud: ซื้อถี่ผิดปกติ (เช่น สคริปต์กดซื้อรัว)
+  const recent = await db
+    .prepare("SELECT COUNT(*) AS total FROM orders WHERE user_id = ? AND created_at >= datetime('now', '-2 minutes')")
+    .bind(user.id)
+    .first();
+  if (Number(recent?.total || 0) >= 5) {
+    await recordFraud(db, {
+      userId: user.id,
+      type: 'rapid_purchase',
+      risk: 'medium',
+      description: `ซื้อ ${recent.total} ออเดอร์ใน 2 นาที`,
+      evidence: { orders: recent.total, productId },
+      ip: ctx.ip,
+    });
+  }
+  const result = await purchaseKeys(db, ctx.env, user, productId, quantity, clientToken, couponCode);
   return json({ ok: true, ...result }, 201);
 }
 
@@ -865,15 +1119,204 @@ async function listMyOrders(ctx) {
 /* top-ups                                                             */
 /* ------------------------------------------------------------------ */
 
+/** มุมมองคำขอเติมเงินที่ส่งให้สมาชิก (ไม่เปิดเผยข้อมูลผู้ตรวจภายใน) */
+function topupView(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    method: row.method,
+    status: row.status,
+    amount: money(row.amount),
+    fee: money(row.fee),
+    net: money(row.net),
+    declaredAmount: money(row.declared_amount || row.amount),
+    reference: row.reference,
+    note: row.review_note || row.note || '',
+    verification: row.verification_source || 'none',
+    voucherCode: row.voucher_code || '',
+    auto: row.status === 'approved' && !row.reviewed_by && row.method === 'envelope',
+    balanceAfter: row.balance_after ? money(row.balance_after) : null,
+    createdAt: row.created_at,
+    reviewedAt: row.reviewed_at || null,
+  };
+}
+
 /** ดึงรหัสซอง (voucher) จากลิงก์ซองทรู เพื่อกันการแจ้งซองเดิมซ้ำ */
 function envelopeVoucherCode(reference) {
-  const match = String(reference || '').match(/[?&]v=([A-Za-z0-9_-]{6,})/);
+  const raw = String(reference || '').trim();
+  // รับเฉพาะลิงก์ซองของ TrueMoney เท่านั้น
+  if (!/^https?:\/\/([a-z0-9-]+\.)*truemoney\.com\//i.test(raw)) return '';
+  const match = raw.match(/[?&]v=([A-Za-z0-9_-]{6,})/);
   return match ? match[1] : '';
+}
+
+/** ข้อความตอบกลับจากทรูมันนี่ → ข้อความที่ผู้ใช้เห็น */
+const TM_FAIL_MESSAGES = {
+  VOUCHER_NOT_FOUND: 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+  VOUCHER_OUT_OF_STOCK: 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+  VOUCHER_ALREADY_USED: 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+  INTERNAL_ERROR: 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+  BAD_PARAM: 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+  TARGET_USER_REDEEMED: 'ซองนี้ถูกรับเงินไปแล้ว ไม่สามารถรับซ้ำได้',
+  VOUCHER_EXPIRED: 'ซองนี้หมดอายุแล้ว (เกิน 72 ชั่วโมง) กรุณาสร้างซองใหม่',
+  CANNOT_GET_OWN_VOUCHER: 'รับซองที่ตัวเองสร้างไม่ได้ กรุณาใช้ซองที่ลูกค้าส่งมาให้ร้าน',
+  TARGET_USER_NOT_FOUND: `เบอร์รับเงิน ${TICKET_PHONE} ยังไม่ผูกพร้อมเพย์/วอลเล็ต กรุณาแจ้งแอดมิน`,
+};
+
+// รหัสที่สรุปได้ชัดเจนว่าซองใช้ไม่ได้ (รหัสอื่น = ยังตรวจไม่ได้ ต้องรอแอดมิน)
+const TM_DEFINITIVE_CODES = new Set([
+  'VOUCHER_NOT_FOUND',
+  'VOUCHER_ALREADY_USED',
+  'VOUCHER_EXPIRED',
+  'VOUCHER_OUT_OF_STOCK',
+  'TARGET_USER_REDEEMED',
+]);
+
+/** ส่งซองผ่าน relay ของร้าน (tools/truemoney-relay.mjs) — คืน null เมื่อ relay ใช้งานไม่ได้ */
+async function redeemViaRelay(env, relayUrl, voucher) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(relayUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(env.TRUEMONEY_RELAY_TOKEN ? { Authorization: `Bearer ${env.TRUEMONEY_RELAY_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({ voucher, mobile: TICKET_PHONE }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!payload) return null;
+    if (payload.ok && Number(payload.amount) > 0) {
+      return {
+        ok: true,
+        amount: money(payload.amount),
+        sender: String(payload.sender || '').slice(0, 80),
+        message: String(payload.message || 'Voucher redeemed successfully!').slice(0, 160),
+      };
+    }
+    if (payload.ok === false && payload.unreachable) return null;
+    const code = String(payload.code || 'RELAY_REJECT');
+    return {
+      ok: false,
+      unreachable: !TM_DEFINITIVE_CODES.has(code),
+      code,
+      message: TM_FAIL_MESSAGES[code] || String(payload.message || 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว').slice(0, 160),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * ส่งลิงก์ซอง + เบอร์รับเงินของร้านไปรับเงินจากทรูมันนี่ แล้วคืนยอดที่ได้รับจริง
+ * ใช้ endpoint เดียวกับหน้า gift.truemoney.com (ไม่เป็นทางการ) — ซองใช้ได้ครั้งเดียว
+ */
+async function redeemTrueMoneyEnvelope(env, voucher) {
+  // ที่อยู่ Worker บน Cloudflare ถูก WAF ของทรูมันนี่บล็อก (HTTP 403)
+  // ถ้าตั้ง TRUEMONEY_RELAY_URL ไว้ (เครื่อง/VPS ของร้านที่ทรูมันนี่ไม่บล็อก) จะใช้ทางนั้น
+  const relayUrl = env.TRUEMONEY_RELAY_URL || '';
+  if (relayUrl) {
+    const relayed = await redeemViaRelay(env, relayUrl, voucher);
+    if (relayed) return relayed;
+  }
+  // ค่าเริ่มต้นคือ "Not Configured": ไม่มีช่องทางตรวจสอบที่ได้รับอนุญาต → ให้แอดมินตรวจเอง
+  // (การยิงตรงไปยัง gift.truemoney.com ไม่ใช่ช่องทางที่ได้รับอนุญาต และถูก WAF บล็อกอยู่แล้ว)
+  // เปิดใช้การยิงตรงได้เฉพาะเมื่อร้านตั้ง TRUEMONEY_DIRECT=1 อย่างชัดเจน
+  if (env.TRUEMONEY_DIRECT !== '1') {
+    return {
+      ok: false,
+      unreachable: true,
+      message: 'ยังไม่ได้ตั้งค่าช่องทางตรวจสอบซอง (TRUEMONEY_RELAY_URL) — รอแอดมินตรวจสอบด้วยตนเอง',
+    };
+  }
+  const url = `https://gift.truemoney.com/campaign/vouchers/${encodeURIComponent(voucher)}/redeem`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  let response = null;
+  let text = '';
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8',
+        Origin: 'https://gift.truemoney.com',
+        Referer: `https://gift.truemoney.com/campaign/?v=${encodeURIComponent(voucher)}`,
+        'User-Agent':
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+      },
+      body: JSON.stringify({ mobile: TICKET_PHONE, voucher_hash: voucher }),
+    });
+    text = await response.text();
+  } catch (error) {
+    return {
+      ok: false,
+      unreachable: true,
+      message: 'เชื่อมต่อทรูมันนี่ไม่ได้ในขณะนี้',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
+  if (!payload || !payload.status) {
+    console.warn('TM_REDEEM_NO_JSON', response.status, text.slice(0, 120).replace(/\s+/g, ' '));
+    return {
+      ok: false,
+      unreachable: response.status === 403 || response.status === 429 || response.status >= 500,
+      message: `ทรูมันนี่ตอบกลับผิดรูปแบบ (HTTP ${response.status})`,
+    };
+  }
+
+  const code = String(payload.status.code || '');
+  if (code !== 'SUCCESS') console.warn('TM_REDEEM_FAIL', response.status, code);
+  if (code !== 'SUCCESS') {
+    // เฉพาะรหัสที่สรุปได้ชัดเจนว่า "ใช้ไม่ได้" จึงปฏิเสธทันที รหัสอื่นถือว่ายังตรวจไม่ได้ → รอแอดมิน
+    return {
+      ok: false,
+      unreachable: !TM_DEFINITIVE_CODES.has(code),
+      code,
+      message: TM_FAIL_MESSAGES[code] || payload.status.message || 'ลิ้งซองไม่ถูกต้องหรือมีคนใช้ไปแล้ว',
+    };
+  }
+
+  const voucherData = payload.data?.voucher || {};
+  const rawAmount =
+    payload.data?.my_ticket?.amount_baht || voucherData.redeemed_amount_baht || voucherData.amount_baht || '0';
+  const received = money(Number(String(rawAmount).replace(/,/g, '')) || 0);
+  if (!(received > 0)) {
+    return {
+      ok: false,
+      unreachable: true,
+      message: 'ทรูมันนี่รับเงินแล้วแต่ไม่มียอดส่งกลับมา',
+    };
+  }
+  return {
+    ok: true,
+    amount: received,
+    sender: payload.data?.owner_profile?.full_name || '',
+    message: payload.status.message || 'Voucher redeemed successfully!',
+  };
 }
 
 async function createTopup(ctx) {
   const { db, request } = ctx;
   const user = requireUser(ctx);
+  if (Number(user.restricted) === 1) {
+    throw new HttpError(403, `บัญชีนี้ถูกระงับการทำธุรกรรม: ${user.restriction_reason || 'กรุณาติดต่อซัพพอร์ต'}`);
+  }
   await enforceRate(db, `topup:${user.id}`, 6, 10 * 60 * 1000);
   const body = await readJson(request, 3072);
   const method = str(body.method, { label: 'ช่องทางเติมเงิน', min: 3, max: 12 });
@@ -885,45 +1328,303 @@ async function createTopup(ctx) {
     throw new HttpError(400, 'กรุณาวางลิงก์ซองทรู (เริ่มต้นด้วย https://)');
   }
 
-  // ซองเดียวกันแจ้งซ้ำไม่ได้ — กันการใช้ซองเดียวเคลมเครดิตหลายรอบ/หลายคน
+  const clientToken = str(body.clientToken, { label: 'รหัสคำขอ', max: 64, required: false });
+  if (method === 'envelope' && clientToken) {
+    const existing = await db
+      .prepare('SELECT * FROM topups WHERE user_id = ? AND idempotency_key = ? LIMIT 1')
+      .bind(user.id, clientToken)
+      .first();
+    if (existing) {
+      return json({
+        ok: true,
+        auto: existing.status === 'approved',
+        pending: ['pending', 'verifying'].includes(existing.status),
+        topup: topupView(existing),
+        message: 'คำขอนี้ถูกบันทึกไว้แล้ว ระบบไม่เพิ่มเครดิตซ้ำ',
+      });
+    }
+  }
+
+  // ---------- TrueMoney Gift Envelope ----------
   if (method === 'envelope') {
     const voucher = envelopeVoucherCode(reference);
     if (!voucher) throw new HttpError(400, 'ลิงก์ซองไม่ถูกต้อง กรุณาคัดลอกจากซองทรูอีกครั้ง');
     const normalized = `https://gift.truemoney.com/campaign/?v=${voucher}`;
+
+    // 1) ซองเดิมที่ยังอยู่ในระบบ (รอตรวจ/อนุมัติ/ซ้ำ) → ปฏิเสธทันที
     const used = await db
       .prepare(
         `SELECT id, user_id, status FROM topups
-         WHERE method = 'envelope' AND status IN ('pending', 'approved')
-           AND (reference = ? OR reference = ? OR reference LIKE ?)
+         WHERE method = 'envelope'
+           AND status IN ('pending', 'verifying', 'approved', 'duplicate')
+           AND (voucher_code = ? OR voucher_code = '' AND (reference = ? OR reference = ? OR reference LIKE ?))
          LIMIT 1`,
       )
-      .bind(reference, normalized, `%v=${voucher}%`)
+      .bind(voucher, reference, normalized, `%v=${voucher}%`)
       .first();
     if (used) {
-      throw new HttpError(
+      const duplicate = await db
+        .prepare(
+          `INSERT INTO topups (user_id, method, amount, fee, net, reference, note, status, voucher_code,
+             verification_source, declared_amount, review_note)
+           VALUES (?, 'envelope', 0, 0, 0, ?, ?, 'duplicate', ?, 'none', ?, ?)`,
+        )
+        .bind(
+          user.id,
+          reference,
+          note,
+          voucher,
+          amount,
+          `ซองนี้ถูกใช้ในระบบแล้ว (รายการ #${used.id}, สถานะ ${used.status})`,
+        )
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO topup_verifications (topup_id, actor_name, action, amount, evidence, note)
+           VALUES (?, 'system', 'duplicate_blocked', 0, ?, ?)`,
+        )
+        .bind(
+          duplicate.meta.last_row_id,
+          `ตรวจพบ voucher ${voucher} ซ้ำกับรายการ #${used.id}`,
+          'ปฏิเสธอัตโนมัติ — ซองเดียวเพิ่มเครดิตได้ครั้งเดียว',
+        )
+        .run();
+      return json(
+        {
+          ok: false,
+          error:
+            used.user_id === user.id
+              ? 'คุณแจ้งซองนี้ไปแล้ว — ระบบกำลังตรวจสอบยอด ไม่ต้องแจ้งซ้ำ'
+              : 'ซองนี้ถูกใช้ในระบบแล้ว ไม่สามารถใช้ซ้ำได้',
+          status: 'duplicate',
+          topup: { id: duplicate.meta.last_row_id, status: 'duplicate', method, amount: 0, fee: 0, net: 0 },
+        },
         409,
-        used.user_id === user.id
-          ? 'คุณแจ้งซองนี้ไปแล้ว — ระบบกำลังตรวจสอบยอด ไม่ต้องแจ้งซ้ำ'
-          : 'ซองนี้ถูกใช้ในระบบแล้ว ไม่สามารถใช้ซ้ำได้',
       );
     }
+
+    const balanceRow = await db.prepare('SELECT balance FROM users WHERE id = ?').bind(user.id).first();
+    const declared = splitFee(amount, FEE_PERCENT);
+
+    // 2) บันทึกคำขอก่อน (สถานะ verifying) เพื่อให้มี Audit Trail เสมอ
+    const created = await db
+      .prepare(
+        `INSERT INTO topups (user_id, method, amount, fee, net, reference, note, status, voucher_code,
+           verification_source, idempotency_key, declared_amount, balance_before)
+         VALUES (?, 'envelope', ?, ?, ?, ?, ?, 'verifying', ?, 'none', ?, ?, ?)`,
+      )
+      .bind(
+        user.id,
+        declared.amount,
+        declared.fee,
+        declared.net,
+        reference,
+        note,
+        voucher,
+        clientToken,
+        declared.amount,
+        fromSatang(toSatang(balanceRow?.balance || 0)),
+      )
+      .run();
+    const topupId = created.meta.last_row_id;
+
+    // 3) ตรวจสอบกับทรูมันนี่ (ผ่าน relay ที่ร้านตั้งไว้ หรือยิงตรง)
+    const redeemed = await redeemTrueMoneyEnvelope(ctx.env, voucher);
+    const relayConfigured = Boolean(ctx.env.TRUEMONEY_RELAY_URL);
+
+    if (redeemed.ok) {
+      // ยอดจริงจากซองเท่านั้นที่นำมาคิดเครดิต
+      const split = splitFee(redeemed.amount, FEE_PERCENT);
+      if (!(split.amountSatang > 0)) {
+        await db
+          .prepare("UPDATE topups SET status = 'pending', review_note = ? WHERE id = ?")
+          .bind('ทรูมันนี่ตอบกลับโดยไม่มียอดเงิน — รอแอดมินตรวจ', topupId)
+          .run();
+        return json({ ok: true, auto: false, pending: true, topup: { id: topupId, status: 'pending' }, message: 'ไม่สามารถยืนยันยอดจากซองได้ ส่งให้แอดมินตรวจสอบแล้ว' }, 201);
+      }
+
+      // ซองเดียวเพิ่มเครดิตได้ครั้งเดียว (UNIQUE ที่ฐานข้อมูล)
+      try {
+        await db
+          .prepare(
+            `INSERT INTO gift_envelope_transactions (topup_id, voucher_code, phone, amount, status, source, raw_response)
+             VALUES (?, ?, ?, ?, 'approved', ?, ?)`,
+          )
+          .bind(
+            topupId,
+            voucher,
+            TICKET_PHONE,
+            split.amount,
+            relayConfigured ? 'relay' : 'api',
+            JSON.stringify({ sender: redeemed.sender || '', message: redeemed.message || '' }).slice(0, 900),
+          )
+          .run();
+      } catch {
+        await db
+          .prepare("UPDATE topups SET status = 'duplicate', review_note = ? WHERE id = ?")
+          .bind('ซองนี้เคยถูกเพิ่มเครดิตไปแล้ว (ฐานข้อมูลปฏิเสธรายการซ้ำ)', topupId)
+          .run();
+        return json(
+          { ok: false, error: 'ซองนี้ถูกใช้ในระบบแล้ว ไม่สามารถใช้ซ้ำได้', status: 'duplicate', topup: { id: topupId, status: 'duplicate' } },
+          409,
+        );
+      }
+
+      const credit = await creditWallet(db, {
+        userId: user.id,
+        amountSatang: split.netSatang,
+        kind: 'topup',
+        refType: 'topup',
+        refId: topupId,
+        note: `เติมเงินซองทรู ฿${split.amount.toFixed(2)} (ค่าธรรมเนียม ${FEE_PERCENT}%)`,
+        idempotencyKey: `topup:${topupId}`,
+      });
+
+      await db
+        .prepare(
+          `UPDATE topups SET amount = ?, fee = ?, net = ?, status = 'approved', verification_source = ?,
+             balance_after = ?, reviewed_at = datetime('now'), review_note = ?
+           WHERE id = ? AND status IN ('pending', 'verifying')`,
+        )
+        .bind(
+          split.amount,
+          split.fee,
+          split.net,
+          relayConfigured ? 'relay' : 'api',
+          credit.after,
+          `ยืนยันยอดจริงจากทรูมันนี่ ฿${split.amount.toFixed(2)}${redeemed.sender ? ` · ผู้ส่ง ${redeemed.sender}` : ''}`,
+          topupId,
+        )
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO topup_verifications (topup_id, actor_name, action, amount, evidence, note)
+           VALUES (?, 'system', 'auto_verified', ?, ?, ?)`,
+        )
+        .bind(
+          topupId,
+          split.amount,
+          `source=${relayConfigured ? 'relay' : 'api'} voucher=${voucher}`,
+          `เครดิตเข้า ฿${split.net.toFixed(2)} (ค่าธรรมเนียม ฿${split.fee.toFixed(2)})`,
+        )
+        .run();
+
+      await recordFraud(db, {
+        userId: user.id,
+        type: 'wallet_mismatch',
+        risk: 'low',
+        description: `ยอดแจ้ง ฿${declared.amount.toFixed(2)} ≠ ยอดจริงในซอง ฿${split.amount.toFixed(2)} — ใช้ยอดจริง`,
+        evidence: { topupId, declared: declared.amount, actual: split.amount },
+        ip: ctx.ip,
+      }).catch(() => null);
+
+      return json(
+        {
+          ok: true,
+          auto: true,
+          pending: false,
+          status: 'approved',
+          topup: {
+            id: topupId,
+            method,
+            status: 'approved',
+            amount: split.amount,
+            fee: split.fee,
+            net: split.net,
+            declaredAmount: declared.amount,
+            verification: relayConfigured ? 'relay' : 'api',
+          },
+          envelope: { amount: split.amount, fee: split.fee, net: split.net, feePercent: FEE_PERCENT },
+          balance: money(credit.after),
+          message: `รับเงินสำเร็จ ฿${split.amount.toFixed(2)} — ค่าธรรมเนียม ${FEE_PERCENT}% (฿${split.fee.toFixed(2)}) เข้าเครดิต ฿${split.net.toFixed(2)}`,
+          notice:
+            declared.amount !== split.amount
+              ? `ยอดในซองจริง ฿${split.amount.toFixed(2)} ระบบใช้ยอดจริงจากทรูมันนี่ ไม่ใช้ยอดที่แจ้ง`
+              : '',
+        },
+        201,
+      );
+    }
+
+    // 4) ตรวจแล้วไม่ผ่าน (ลิงก์ผิด/ใช้แล้ว/หมดอายุ) → บันทึกสถานะตามจริง ไม่เพิ่มเครดิต
+    if (!redeemed.unreachable) {
+      const status = redeemed.code === 'VOUCHER_EXPIRED' ? 'expired' : 'rejected';
+      await db
+        .prepare("UPDATE topups SET status = ?, verification_source = 'api', review_note = ? WHERE id = ?")
+        .bind(status, redeemed.message, topupId)
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO topup_verifications (topup_id, actor_name, action, amount, evidence, note)
+           VALUES (?, 'system', 'auto_verify_failed', 0, ?, ?)`,
+        )
+        .bind(topupId, `code=${redeemed.code || 'UNKNOWN'} voucher=${voucher}`, redeemed.message)
+        .run();
+      return json(
+        {
+          ok: false,
+          error: redeemed.message,
+          status,
+          topup: { id: topupId, status, method, amount: 0, fee: 0, net: 0, note: redeemed.message },
+        },
+        400,
+      );
+    }
+
+    // 5) ติดต่อทรูมันนี่ไม่ได้ / ยังไม่ตั้งค่าช่องทางตรวจสอบ → Pending Verification (ห้ามเติมเครดิตอัตโนมัติ)
+    await db
+      .prepare(
+        `UPDATE topups SET status = 'pending', verification_source = 'none', review_note = ?
+         WHERE id = ? AND status = 'verifying'`,
+      )
+      .bind(`ไม่สามารถตรวจสอบอัตโนมัติได้: ${redeemed.message} — รอแอดมินตรวจสอบหลักฐาน`, topupId)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO topup_verifications (topup_id, actor_name, action, amount, evidence, note)
+         VALUES (?, 'system', 'verification_unavailable', 0, ?, ?)`,
+      )
+      .bind(topupId, redeemed.message, 'Not Configured / ติดต่อผู้ให้บริการไม่ได้ — ส่งต่อแอดมินตรวจด้วยตนเอง')
+      .run();
+
+    return json(
+      {
+        ok: true,
+        auto: false,
+        pending: true,
+        status: 'pending',
+        verification: relayConfigured ? 'unavailable' : 'not_configured',
+        topup: {
+          id: topupId,
+          method,
+          status: 'pending',
+          amount: declared.amount,
+          fee: declared.fee,
+          net: declared.net,
+          declaredAmount: declared.amount,
+        },
+        message: `ระบบยังตรวจสอบซองอัตโนมัติไม่ได้ (${redeemed.message}) — บันทึกเป็น "รอตรวจสอบ" แล้ว แอดมินจะตรวจยอดจริงและเติมเครดิตให้ ยังไม่มีการเพิ่มเครดิตในขั้นตอนนี้`,
+      },
+      201,
+    );
   }
 
-  const fee = money((amount * FEE_PERCENT) / 100);
-  const net = money(amount - fee);
+  const split = splitFee(amount, FEE_PERCENT);
   const result = await db
     .prepare(
-      `INSERT INTO topups (user_id, method, amount, fee, net, reference, note, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      `INSERT INTO topups (user_id, method, amount, fee, net, reference, note, status, declared_amount, verification_source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'manual')`,
     )
-    .bind(user.id, method, amount, fee, net, reference, note)
+    .bind(user.id, method, split.amount, split.fee, split.net, reference, note, split.amount)
     .run();
 
   return json(
     {
       ok: true,
-      topup: { id: result.meta.last_row_id, method, amount, fee, net, status: 'pending' },
-      message: `แจ้งเติมเงิน ฿${amount.toLocaleString('th-TH')} แล้ว รอแอดมินตรวจสอบ — รับจริง ฿${net.toLocaleString('th-TH')} (หัก ${FEE_PERCENT}% = ฿${fee.toLocaleString('th-TH')})`,
+      auto: false,
+      pending: true,
+      topup: { id: result.meta.last_row_id, method, amount: split.amount, fee: split.fee, net: split.net, status: 'pending' },
+      message: `แจ้งเติมเงิน ฿${split.amount.toFixed(2)} แล้ว รอแอดมินตรวจสอบ — รับจริง ฿${split.net.toFixed(2)} (หัก ${FEE_PERCENT}% = ฿${split.fee.toFixed(2)})`,
     },
     201,
   );
@@ -934,13 +1635,21 @@ async function listMyTopups(ctx) {
   const settings = await getSettings(ctx.db);
   const rows = await ctx.db
     .prepare(
-      `SELECT id, method, amount, fee, net, reference, status, created_at, review_note
+      `SELECT id, method, amount, fee, net, declared_amount, reference, status, created_at, review_note,
+              reviewed_by, reviewed_at, voucher_code, verification_source, balance_after
        FROM topups WHERE user_id = ? ORDER BY id DESC LIMIT 60`,
     )
     .bind(user.id)
     .all();
   return json({
     feePercent: FEE_PERCENT,
+    verification: {
+      mode: ctx.env.TRUEMONEY_RELAY_URL ? 'relay' : 'unconfigured',
+      configured: Boolean(ctx.env.TRUEMONEY_RELAY_URL),
+      message: ctx.env.TRUEMONEY_RELAY_URL
+        ? 'ระบบตรวจสอบซองอัตโนมัติผ่าน relay ของร้าน'
+        : 'ยังไม่ได้เชื่อมต่อผู้ให้บริการตรวจสอบซอง — คำขอจะถูกส่งให้แอดมินตรวจสอบด้วยตนเอง',
+    },
     payment: {
       ticketPhone: TICKET_PHONE,
       bank: {
@@ -950,17 +1659,7 @@ async function listMyTopups(ctx) {
       },
       note: settings.topup_note || '',
     },
-    topups: rows.results.map((t) => ({
-      id: t.id,
-      method: t.method,
-      amount: money(t.amount),
-      fee: money(t.fee),
-      net: money(t.net),
-      reference: t.reference,
-      status: t.status,
-      note: t.review_note,
-      createdAt: t.created_at,
-    })),
+    topups: rows.results.map(topupView),
   });
 }
 
@@ -1187,7 +1886,7 @@ async function apiDealerPurchase(ctx) {
   const body = await readJson(ctx.request, 2048);
   const productId = num(body.productId, { label: 'สินค้า', min: 1, max: 1e9, integer: true });
   const quantity = num(body.quantity ?? 1, { label: 'จำนวน', min: 1, max: 10, integer: true });
-  const result = await purchaseKeys(db, user, productId, quantity);
+  const result = await purchaseKeys(db, ctx.env, user, productId, quantity);
   return json(
     {
       ok: true,
@@ -1559,55 +2258,159 @@ async function adminListTopups(ctx) {
 
 async function adminReviewTopup(ctx, id) {
   const db = ctx.env.DB;
-  const body = await readJson(ctx.request, 2048);
+  const topupId = Number(id);
+  const body = await readJson(ctx.request, 4096);
   const action = str(body.action, { label: 'การทำรายการ', min: 5, max: 10 });
-  if (action !== 'approve' && action !== 'reject') throw new HttpError(400, 'การทำรายการไม่ถูกต้อง');
-  const reviewNote = str(body.note, { label: 'หมายเหตุ', max: 200, required: false });
+  if (!['approve', 'reject', 'reverify'].includes(action)) throw new HttpError(400, 'การทำรายการไม่ถูกต้อง');
+  const note = str(body.note, { label: 'หมายเหตุ', max: 300, required: false });
+  const evidence = str(body.evidence, { label: 'หลักฐานการตรวจสอบ', max: 500, required: false });
 
-  const topup = await db.prepare('SELECT * FROM topups WHERE id = ?').bind(id).first();
+  const topup = await db.prepare('SELECT * FROM topups WHERE id = ?').bind(topupId).first();
   if (!topup) throw new HttpError(404, 'ไม่พบรายการเติมเงิน');
-  if (topup.status !== 'pending') throw new HttpError(409, 'รายการนี้ถูกตรวจสอบไปแล้ว');
+  if (!['pending', 'verifying'].includes(topup.status)) {
+    throw new HttpError(409, `รายการนี้ถูกตรวจสอบไปแล้ว (สถานะ ${topup.status})`);
+  }
+
+  const logVerification = async (verificationAction, amount, extraNote) => {
+    await db
+      .prepare(
+        `INSERT INTO topup_verifications (topup_id, actor_id, actor_name, action, amount, evidence, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        topupId,
+        ctx.user.id,
+        ctx.user.username,
+        verificationAction,
+        amount,
+        String(evidence || '').slice(0, 500),
+        String(extraNote || '').slice(0, 300),
+      )
+      .run();
+  };
+
+  if (action === 'reverify') {
+    await db.prepare("UPDATE topups SET status = 'verifying' WHERE id = ? AND status = 'pending'").bind(topupId).run();
+    await logVerification('manual_review_started', 0, note || 'แอดมินเริ่มตรวจสอบหลักฐาน');
+    await logStaff(ctx, 'topup.reverify', `#${topupId} เริ่มตรวจสอบ`);
+    return json({ ok: true, status: 'verifying' });
+  }
 
   if (action === 'reject') {
+    if (note.trim().length < 3) throw new HttpError(400, 'กรุณาระบุเหตุผลในการปฏิเสธอย่างน้อย 3 ตัวอักษร');
     const result = await db
       .prepare(
         `UPDATE topups SET status = 'rejected', reviewed_by = ?, reviewed_at = datetime('now'), review_note = ?
-         WHERE id = ? AND status = 'pending'`,
+         WHERE id = ? AND status IN ('pending', 'verifying')`,
       )
-      .bind(ctx.user.id, reviewNote, id)
+      .bind(ctx.user.id, note, topupId)
       .run();
     if (Number(result.meta.changes) !== 1) throw new HttpError(409, 'รายการนี้ถูกตรวจสอบไปแล้ว');
-    await logStaff(ctx, 'topup.reject', `#${id} ฿${money(topup.amount)}`);
-    return json({ ok: true, status: 'rejected' });
+    await logVerification('reject', 0, note);
+    await logStaff(ctx, 'topup.reject', `#${topupId} ฿${money(topup.amount)} — ${note}`);
+    if (topup.method === 'envelope' && topup.voucher_code) {
+      await db
+        .prepare(
+          `UPDATE gift_envelope_transactions SET status = 'rejected' WHERE voucher_code = ? AND status = 'pending'`,
+        )
+        .bind(topup.voucher_code)
+        .run();
+    }
+    return json({ ok: true, status: 'rejected', note });
   }
 
-  const amount = money(topup.amount);
-  const fee = money((amount * FEE_PERCENT) / 100);
-  const net = money(amount - fee);
+  // ---------- approve (ตรวจสอบด้วยแอดมิน) ----------
+  // ยอดจริงต้องมาจากการตรวจสอบ ไม่เชื่อยอดที่สมาชิกกรอก — แอดมินต้องยืนยันยอดจริง
+  const actual =
+    body.amount === undefined || body.amount === null || body.amount === ''
+      ? money(topup.declared_amount || topup.amount)
+      : num(body.amount, { label: 'ยอดเงินจริงในซอง', min: 1, max: 200000 });
+  const split = splitFee(actual, FEE_PERCENT);
+  if (!(split.amountSatang > 0)) throw new HttpError(400, 'ยอดเงินจริงไม่ถูกต้อง');
 
-  const result = await db
+  // 1) จองสถานะก่อน → กันการอนุมัติซ้ำพร้อมกัน
+  const claimed = await db
     .prepare(
-      `UPDATE topups SET status = 'approved', fee = ?, net = ?, reviewed_by = ?,
-       reviewed_at = datetime('now'), review_note = ?
-       WHERE id = ? AND status = 'pending'`,
+      `UPDATE topups SET status = 'approved', amount = ?, fee = ?, net = ?, reviewed_by = ?,
+         reviewed_at = datetime('now'), review_note = ?, verification_source = 'manual'
+       WHERE id = ? AND status IN ('pending', 'verifying')`,
     )
-    .bind(fee, net, ctx.user.id, reviewNote, id)
+    .bind(split.amount, split.fee, split.net, ctx.user.id, note || 'แอดมินตรวจสอบยอดจริงแล้ว', topupId)
     .run();
-  if (Number(result.meta.changes) !== 1) throw new HttpError(409, 'รายการนี้ถูกตรวจสอบไปแล้ว');
+  if (Number(claimed.meta.changes) !== 1) throw new HttpError(409, 'รายการนี้ถูกตรวจสอบไปแล้ว');
 
-  await db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(net, topup.user_id).run();
-  const user = await db.prepare('SELECT balance FROM users WHERE id = ?').bind(topup.user_id).first();
-  await logStaff(ctx, 'topup.approve', `#${id} รับ ฿${amount} หัก 3% (฿${fee}) เข้า ฿${net}`);
+  // 2) หนึ่งซอง = หนึ่งครั้ง (UNIQUE ที่ฐานข้อมูล)
+  if (topup.method === 'envelope' && topup.voucher_code) {
+    try {
+      await db
+        .prepare(
+          `INSERT INTO gift_envelope_transactions (topup_id, voucher_code, phone, amount, status, source, raw_response)
+           VALUES (?, ?, ?, ?, 'approved', 'manual', ?)`,
+        )
+        .bind(topupId, topup.voucher_code, TICKET_PHONE, split.amount, String(evidence || note || '').slice(0, 900))
+        .run();
+    } catch {
+      await db
+        .prepare("UPDATE topups SET status = 'duplicate', review_note = ? WHERE id = ?")
+        .bind('ซองนี้เคยถูกเพิ่มเครดิตในระบบแล้ว — ปฏิเสธเพื่อกันเครดิตซ้ำ', topupId)
+        .run();
+      await logVerification('duplicate_blocked', 0, 'voucher ซ้ำ');
+      throw new HttpError(409, 'ซองนี้เคยเพิ่มเครดิตในระบบแล้ว ไม่สามารถอนุมัติซ้ำได้');
+    }
+  }
+
+  // 3) เพิ่มเครดิตแบบ idempotent + บันทึกกระเป๋า
+  const credit = await creditWallet(db, {
+    userId: topup.user_id,
+    amountSatang: split.netSatang,
+    kind: 'topup',
+    refType: 'topup',
+    refId: topupId,
+    note: `${topup.method === 'envelope' ? 'ซองทรู' : 'โอนธนาคาร'} ฿${split.amount.toFixed(2)} (ค่าธรรมเนียม ${FEE_PERCENT}%) โดย ${ctx.user.username}`,
+    idempotencyKey: `topup:${topupId}`,
+    actorId: ctx.user.id,
+  });
+  if (!credit.credited) {
+    await db
+      .prepare("UPDATE topups SET status = 'duplicate', review_note = ? WHERE id = ?")
+      .bind('ตรวจพบการเติมเครดิตซ้ำ (idempotency) — ไม่เพิ่มเครดิตอีก', topupId)
+      .run();
+    await logVerification('duplicate_credit_blocked', 0, 'idempotency ตรงกับธุรกรรมเดิม');
+    throw new HttpError(409, 'รายการนี้เคยเติมเครดิตแล้ว ไม่สามารถเติมซ้ำได้');
+  }
+
+  await db
+    .prepare('UPDATE topups SET balance_after = ? WHERE id = ?')
+    .bind(credit.after, topupId)
+    .run();
+  await logVerification('approve', split.amount, note || 'ตรวจสอบยอดจริงและอนุมัติ');
+  await logStaff(
+    ctx,
+    'topup.approve',
+    `#${topupId} ยอดจริง ฿${split.amount.toFixed(2)} หัก ${FEE_PERCENT}% (฿${split.fee.toFixed(2)}) เข้า ฿${split.net.toFixed(2)}`,
+  );
+
+  const user = await db.prepare('SELECT balance, email FROM users WHERE id = ?').bind(topup.user_id).first();
+  if (user?.email) {
+    await sendEmail(ctx.env, db, {
+      userId: topup.user_id,
+      to: user.email,
+      event: 'topup_approved',
+      vars: { amount: money(split.amount), net: money(split.net), fee: money(split.fee) },
+    });
+  }
 
   return json({
     ok: true,
     status: 'approved',
-    amount,
-    fee,
-    net,
+    amount: split.amount,
+    fee: split.fee,
+    net: split.net,
     feePercent: FEE_PERCENT,
+    balanceBefore: credit.before,
+    balanceAfter: credit.after,
     balance: money(user?.balance || 0),
-    message: `รับเงิน ฿${amount.toLocaleString('th-TH')} — หัก ${FEE_PERCENT}% (฿${fee.toLocaleString('th-TH')}) — เติมเข้าบัญชี ฿${net.toLocaleString('th-TH')}`,
+    message: `ยืนยันยอดจริง ฿${split.amount.toFixed(2)} — ค่าธรรมเนียม ${FEE_PERCENT}% (฿${split.fee.toFixed(2)}) — เติมเครดิต ฿${split.net.toFixed(2)}`,
   });
 }
 
@@ -1708,6 +2511,18 @@ async function adminReplyTicket(ctx, id) {
     .run();
   if (Number(result.meta.changes) !== 1) throw new HttpError(404, 'ไม่พบเรื่องนี้');
   await logStaff(ctx, 'ticket.reply', `#${id}`);
+  const ticket = await db
+    .prepare('SELECT t.user_id, u.email FROM tickets t JOIN users u ON u.id = t.user_id WHERE t.id = ?')
+    .bind(id)
+    .first();
+  if (ticket?.email) {
+    await sendEmail(ctx.env, db, {
+      userId: ticket.user_id,
+      to: ticket.email,
+      event: 'ticket_reply',
+      vars: { ticketId: id, reply },
+    });
+  }
   return json({ ok: true });
 }
 
@@ -2022,6 +2837,247 @@ async function adminCouponUsages(ctx, id) {
 /* router                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* กระเป๋าเงิน (Wallet Ledger) — เฉพาะเจ้าของบัญชี                     */
+/* ------------------------------------------------------------------ */
+
+async function myWallet(ctx) {
+  const user = requireUser(ctx);
+  const db = ctx.db;
+  const rows = await db
+    .prepare(
+      `SELECT id, kind, amount, balance_before, balance_after, ref_type, ref_id, note, created_at
+       FROM wallet_transactions WHERE user_id = ? ORDER BY id DESC LIMIT 100`,
+    )
+    .bind(user.id)
+    .all();
+  const summary = await db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN kind = 'topup' THEN amount ELSE 0 END), 0) AS topup_total,
+         COALESCE(SUM(CASE WHEN kind = 'purchase' THEN -amount ELSE 0 END), 0) AS spend_total,
+         COUNT(*) AS total
+       FROM wallet_transactions WHERE user_id = ?`,
+    )
+    .bind(user.id)
+    .first();
+  const pending = await db
+    .prepare(
+      `SELECT COUNT(*) AS c, COALESCE(SUM(CASE WHEN declared_amount > 0 THEN declared_amount ELSE amount END), 0) AS amt
+       FROM topups WHERE user_id = ? AND status IN ('pending', 'verifying')`,
+    )
+    .bind(user.id)
+    .first();
+  const fresh = await db.prepare('SELECT balance, points FROM users WHERE id = ?').bind(user.id).first();
+  const kindLabels = {
+    topup: 'เติมเงิน',
+    purchase: 'ซื้อสินค้า',
+    refund: 'คืนเงิน',
+    adjust: 'ปรับยอดโดยแอดมิน',
+    bonus: 'โบนัส',
+  };
+  return json({
+    balance: money(fresh?.balance || 0),
+    points: Number(fresh?.points || 0),
+    summary: {
+      topupTotal: money(summary?.topup_total || 0),
+      spendTotal: money(summary?.spend_total || 0),
+      transactions: Number(summary?.total || 0),
+      pendingCount: Number(pending?.c || 0),
+      pendingAmount: money(pending?.amt || 0),
+    },
+    transactions: rows.results.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      kindLabel: kindLabels[row.kind] || row.kind,
+      amount: money(row.amount),
+      direction: row.kind === 'purchase' ? 'out' : 'in',
+      balanceBefore: money(row.balance_before),
+      balanceAfter: money(row.balance_after),
+      refType: row.ref_type,
+      refId: row.ref_id,
+      note: row.note,
+      createdAt: row.created_at,
+    })),
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Admin — TrueMoney Gift Envelope Desk                                */
+/* ------------------------------------------------------------------ */
+
+async function adminTopupDesk(ctx) {
+  const db = ctx.env.DB;
+  const q = String(ctx.url.searchParams.get('q') || '').trim().slice(0, 60);
+  const status = String(ctx.url.searchParams.get('status') || 'all');
+  const allowedStatus = ['all', 'pending', 'verifying', 'approved', 'rejected', 'expired', 'duplicate'];
+  const filter = allowedStatus.includes(status) ? status : 'all';
+
+  const where = ["t.method = 'envelope'"];
+  const binds = [];
+  if (q) {
+    where.push('(u.username LIKE ? OR CAST(t.id AS TEXT) = ? OR t.voucher_code LIKE ? OR t.reference LIKE ?)');
+    binds.push(`%${q}%`, q, `%${q}%`, `%${q}%`);
+  }
+  if (filter !== 'all') {
+    where.push('t.status = ?');
+    binds.push(filter);
+  }
+
+  const rows = await db
+    .prepare(
+      `SELECT t.*, u.username, u.balance, r.username AS reviewer
+       FROM topups t
+       LEFT JOIN users u ON u.id = t.user_id
+       LEFT JOIN users r ON r.id = t.reviewed_by
+       WHERE ${where.join(' AND ')}
+       ORDER BY t.id DESC LIMIT 200`,
+    )
+    .bind(...binds)
+    .all();
+
+  const totals = await db
+    .prepare(
+      `SELECT status, COUNT(*) AS c, COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(fee), 0) AS fee, COALESCE(SUM(net), 0) AS net
+       FROM topups WHERE method = 'envelope' GROUP BY status`,
+    )
+    .all();
+  const approved = totals.results.find((row) => row.status === 'approved') || { c: 0, amount: 0, fee: 0, net: 0 };
+  const logs = await db
+    .prepare(
+      `SELECT v.*, t.voucher_code, u.username AS member
+       FROM topup_verifications v
+       LEFT JOIN topups t ON t.id = v.topup_id
+       LEFT JOIN users u ON u.id = t.user_id
+       ORDER BY v.id DESC LIMIT 60`,
+    )
+    .all();
+
+  return json({
+    verification: {
+      configured: Boolean(ctx.env.TRUEMONEY_RELAY_URL),
+      mode: ctx.env.TRUEMONEY_RELAY_URL ? 'relay' : 'manual',
+      status: ctx.env.TRUEMONEY_RELAY_URL ? 'configured' : 'Not Configured',
+      message: ctx.env.TRUEMONEY_RELAY_URL
+        ? 'ตรวจสอบซองอัตโนมัติผ่าน relay ของร้าน'
+        : 'ยังไม่มีช่องทางตรวจสอบที่ได้รับอนุญาต — ใช้การตรวจสอบด้วยแอดมิน',
+    },
+    totals: {
+      approvedCount: Number(approved.c || 0),
+      approvedAmount: thb(approved.amount),
+      feeTotal: thb(approved.fee),
+      netTotal: thb(approved.net),
+      pendingCount: Number((totals.results.find((row) => row.status === 'pending') || {}).c || 0),
+      statuses: totals.results.map((row) => ({ status: row.status, count: Number(row.c) })),
+    },
+    topups: rows.results.map((row) => ({
+      ...topupView(row),
+      username: row.username || '',
+      userId: row.user_id,
+      reviewer: row.reviewer || '',
+      userBalance: money(row.balance || 0),
+      hasVoucher: Boolean(row.voucher_code),
+    })),
+    logs: logs.results.map((row) => ({
+      id: row.id,
+      topupId: row.topup_id,
+      action: row.action,
+      actor: row.actor_name || 'system',
+      amount: money(row.amount),
+      evidence: row.evidence,
+      note: row.note,
+      voucherCode: row.voucher_code || '',
+      member: row.member || '',
+      createdAt: row.created_at,
+    })),
+  });
+}
+
+async function adminTopupDetail(ctx, id) {
+  const db = ctx.env.DB;
+  const topupId = Number(id);
+  const row = await db
+    .prepare(
+      `SELECT t.*, u.username, u.balance, r.username AS reviewer
+       FROM topups t LEFT JOIN users u ON u.id = t.user_id LEFT JOIN users r ON r.id = t.reviewed_by
+       WHERE t.id = ?`,
+    )
+    .bind(topupId)
+    .first();
+  if (!row) throw new HttpError(404, 'ไม่พบรายการเติมเงิน');
+  const [logs, wallet, envelope] = await db.batch([
+    db.prepare('SELECT * FROM topup_verifications WHERE topup_id = ? ORDER BY id ASC').bind(topupId),
+    db
+      .prepare('SELECT * FROM wallet_transactions WHERE ref_type = ? AND ref_id = ? ORDER BY id ASC')
+      .bind('topup', topupId),
+    db.prepare('SELECT * FROM gift_envelope_transactions WHERE topup_id = ?').bind(topupId),
+  ]);
+  return json({
+    topup: {
+      ...topupView(row),
+      username: row.username || '',
+      userId: row.user_id,
+      reviewer: row.reviewer || '',
+      userBalance: money(row.balance || 0),
+      verificationSource: row.verification_source,
+      balanceBefore: money(row.balance_before),
+      balanceAfter: money(row.balance_after),
+      declaredAmount: money(row.declared_amount || row.amount),
+    },
+    verifications: logs.results.map((log) => ({
+      id: log.id,
+      action: log.action,
+      actor: log.actor_name || 'system',
+      amount: money(log.amount),
+      evidence: log.evidence,
+      note: log.note,
+      createdAt: log.created_at,
+    })),
+    walletTransactions: wallet.results.map((tx) => ({
+      id: tx.id,
+      kind: tx.kind,
+      amount: money(tx.amount),
+      balanceBefore: money(tx.balance_before),
+      balanceAfter: money(tx.balance_after),
+      createdAt: tx.created_at,
+    })),
+    envelope: envelope.results.map((env) => ({
+      voucherCode: env.voucher_code,
+      amount: money(env.amount),
+      status: env.status,
+      source: env.source,
+      createdAt: env.created_at,
+    })),
+  });
+}
+
+
+const ultimate = createUltimate({
+  HttpError,
+  json,
+  readJson,
+  str,
+  num,
+  money,
+  requireUser,
+  requireStaff,
+  requireOwner,
+  logStaff,
+  roleRank,
+  clientIp,
+  publicUser,
+  getSettings,
+  syncStock,
+  audit,
+  ROLES,
+  STAFF_SET,
+});
+
+/** ตัวกันสิทธิ์ระดับ route — ตรวจจากฐานข้อมูลทุกครั้ง */
+const perm = (name) => async (ctx) => {
+  await requirePermission(ctx, name);
+};
+
 const routes = [
   ['GET', /^\/api\/health$/, health],
   ['GET', /^\/api\/config$/, getConfig],
@@ -2039,6 +3095,7 @@ const routes = [
   ['POST', /^\/api\/coupons\/validate$/, quoteCoupon],
   ['POST', /^\/api\/topups$/, createTopup],
   ['GET', /^\/api\/topups$/, listMyTopups],
+  ['GET', /^\/api\/wallet$/, myWallet],
   ['POST', /^\/api\/tickets$/, createTicket],
   ['GET', /^\/api\/tickets$/, listMyTickets],
   ['GET', /^\/api\/reseller$/, resellerSummary],
@@ -2048,34 +3105,37 @@ const routes = [
   ['DELETE', /^\/api\/reseller\/keys\/(\d+)$/, resellerRevokeKey],
   ['GET', /^\/api\/v1\/products$/, apiDealerProducts],
   ['POST', /^\/api\/v1\/purchase$/, apiDealerPurchase],
-  ['GET', /^\/api\/admin\/overview$/, adminOverview],
+  ['GET', /^\/api\/admin\/overview$/, adminOverview, perm('analytics.view')],
   ['GET', /^\/api\/admin\/products$/, adminListProducts],
-  ['POST', /^\/api\/admin\/products$/, adminCreateProduct],
-  ['PATCH', /^\/api\/admin\/products\/(\d+)$/, adminUpdateProduct],
-  ['DELETE', /^\/api\/admin\/products\/(\d+)$/, adminDeleteProduct],
-  ['GET', /^\/api\/admin\/products\/(\d+)\/keys$/, adminListKeys],
-  ['POST', /^\/api\/admin\/products\/(\d+)\/keys$/, adminAddKeys],
-  ['DELETE', /^\/api\/admin\/products\/(\d+)\/keys\/(\d+)$/, adminDeleteKey],
-  ['DELETE', /^\/api\/admin\/products\/(\d+)\/demo-keys$/, adminDeleteDemoKeys],
+  ['POST', /^\/api\/admin\/products$/, adminCreateProduct, perm('catalog.manage')],
+  ['PATCH', /^\/api\/admin\/products\/(\d+)$/, adminUpdateProduct, perm('catalog.manage')],
+  ['DELETE', /^\/api\/admin\/products\/(\d+)$/, adminDeleteProduct, perm('catalog.manage')],
+  ['GET', /^\/api\/admin\/products\/(\d+)\/keys$/, adminListKeys, perm('keys.manage')],
+  ['POST', /^\/api\/admin\/products\/(\d+)\/keys$/, adminAddKeys, perm('keys.manage')],
+  ['DELETE', /^\/api\/admin\/products\/(\d+)\/keys\/(\d+)$/, adminDeleteKey, perm('keys.manage')],
+  ['DELETE', /^\/api\/admin\/products\/(\d+)\/demo-keys$/, adminDeleteDemoKeys, perm('keys.manage')],
   ['GET', /^\/api\/admin\/categories$/, adminListCategories],
-  ['POST', /^\/api\/admin\/categories$/, adminCreateCategory],
-  ['PATCH', /^\/api\/admin\/categories\/(\d+)$/, adminUpdateCategory],
-  ['DELETE', /^\/api\/admin\/categories\/(\d+)$/, adminDeleteCategory],
-  ['GET', /^\/api\/admin\/topups$/, adminListTopups],
-  ['POST', /^\/api\/admin\/topups\/(\d+)\/review$/, adminReviewTopup],
+  ['POST', /^\/api\/admin\/categories$/, adminCreateCategory, perm('catalog.manage')],
+  ['PATCH', /^\/api\/admin\/categories\/(\d+)$/, adminUpdateCategory, perm('catalog.manage')],
+  ['DELETE', /^\/api\/admin\/categories\/(\d+)$/, adminDeleteCategory, perm('catalog.manage')],
+  ['GET', /^\/api\/admin\/topups$/, adminListTopups, perm('wallet.manage')],
+  ['GET', /^\/api\/admin\/topups\/envelope$/, adminTopupDesk, perm('wallet.manage')],
+  ['GET', /^\/api\/admin\/topups\/(\d+)$/, adminTopupDetail, perm('wallet.manage')],
+  ['POST', /^\/api\/admin\/topups\/(\d+)\/review$/, adminReviewTopup, perm('wallet.manage')],
   ['GET', /^\/api\/admin\/coupons$/, adminListCoupons],
-  ['POST', /^\/api\/admin\/coupons$/, adminCreateCoupon],
-  ['PATCH', /^\/api\/admin\/coupons\/(\d+)$/, adminUpdateCoupon],
-  ['DELETE', /^\/api\/admin\/coupons\/(\d+)$/, adminDeleteCoupon],
+  ['POST', /^\/api\/admin\/coupons$/, adminCreateCoupon, perm('coupons.manage')],
+  ['PATCH', /^\/api\/admin\/coupons\/(\d+)$/, adminUpdateCoupon, perm('coupons.manage')],
+  ['DELETE', /^\/api\/admin\/coupons\/(\d+)$/, adminDeleteCoupon, perm('coupons.manage')],
   ['GET', /^\/api\/admin\/coupons\/(\d+)\/usages$/, adminCouponUsages],
-  ['GET', /^\/api\/admin\/users$/, adminListUsers],
-  ['PATCH', /^\/api\/admin\/users\/(\d+)\/role$/, adminUpdateRole, requireOwner],
-  ['POST', /^\/api\/admin\/settings$/, adminUpdateSettings],
-  ['GET', /^\/api\/admin\/tickets$/, adminListTickets],
-  ['POST', /^\/api\/admin\/tickets\/(\d+)\/reply$/, adminReplyTicket],
-  ['GET', /^\/api\/admin\/logs$/, adminLogs],
-  ['GET', /^\/api\/admin\/resellers$/, adminListResellers],
-  ['POST', /^\/api\/admin\/resellers\/(\d+)\/review$/, adminReviewReseller],
+  ['GET', /^\/api\/admin\/users$/, adminListUsers, perm('users.view')],
+  ['PATCH', /^\/api\/admin\/users\/(\d+)\/role$/, adminUpdateRole, perm('roles.manage')],
+  ['POST', /^\/api\/admin\/settings$/, adminUpdateSettings, perm('settings.manage')],
+  ['GET', /^\/api\/admin\/tickets$/, adminListTickets, perm('tickets.view')],
+  ['POST', /^\/api\/admin\/tickets\/(\d+)\/reply$/, adminReplyTicket, perm('tickets.reply')],
+  ['GET', /^\/api\/admin\/logs$/, adminLogs, perm('audit.view')],
+  ['GET', /^\/api\/admin\/resellers$/, adminListResellers, perm('reseller.manage')],
+  ['POST', /^\/api\/admin\/resellers\/(\d+)\/review$/, adminReviewReseller, perm('reseller.manage')],
+  ...ultimate.routes,
 ];
 
 const SECURITY_HEADERS = {
@@ -2087,7 +3147,7 @@ const SECURITY_HEADERS = {
   // กันสำเนาเว็บ (cache/snippet) โดยไม่ปิดการค้นหาปกติ
   'x-robots-tag': 'noarchive, nosnippet, noimageindex',
   'content-security-policy':
-    "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'",
+    "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' https://challenges.cloudflare.com https://static.cloudflareinsights.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'self'; connect-src 'self' https://cloudflareinsights.com https://static.cloudflareinsights.com; base-uri 'self'; form-action 'self'",
 };
 
 /* ------------------------------------------------------------------ */
@@ -2176,11 +3236,23 @@ export default {
 
     const secret = env.SESSION_SECRET || 'firekey-dev-session-secret-please-change';
 
+    const isConfig = request.method === 'GET' && url.pathname === '/api/config';
+    let dbReady = true;
+
     try {
-      await initDb(env);
+      try {
+        await initDb(env);
+      } catch (initError) {
+        dbReady = false;
+        console.error('INIT_DB', initError && initError.stack ? initError.stack : initError);
+        // /api/config ใช้ค่าเริ่มต้นได้โดยไม่ต้องพึ่งฐานข้อมูล → ปล่อยให้หน้าเว็บเปิดได้
+        if (!isConfig) throw initError;
+      }
 
       // ชั้นป้องกัน DDoS / flood / bot spam — ทุกคำขอ API ต้องผ่านก่อน
-      await guardRequest({ db: env.DB, ip: clientIp(request), method: request.method, url: request.url });
+      if (dbReady) {
+        await guardRequest({ db: env.DB, ip: clientIp(request), method: request.method, url: request.url });
+      }
 
       const cookieHeader = request.headers.get('cookie') || '';
       const cookies = parseCookies(cookieHeader);
@@ -2195,7 +3267,7 @@ export default {
         }
       }
 
-      const session = await readSession(secret, cookies[SESSION_COOKIE]);
+      const session = dbReady ? await readSession(secret, cookies[SESSION_COOKIE]) : null;
       let user = null;
       if (session) {
         user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(session.uid).first();
@@ -2212,12 +3284,36 @@ export default {
         ip: clientIp(request),
       };
 
+      // อัปเดตเวลาออนไลน์ (ไม่เกิน 1 ครั้ง/นาทีต่อผู้ใช้) เพื่อใช้ใน Analytics จริง
+      if (user && dbReady && url.pathname !== '/api/live') {
+        try {
+          await env.DB.prepare(
+            "UPDATE users SET online_at = datetime('now') WHERE id = ? AND (online_at IS NULL OR online_at < datetime('now', '-1 minute'))",
+          )
+            .bind(user.id)
+            .run();
+        } catch {
+          /* ไม่กระทบคำขอหลัก */
+        }
+      }
+
+      // Maintenance Mode — บล็อกเฉพาะ API ของสมาชิก ทีมงานยังเข้าได้
+      if (dbReady && !STAFF_SET.has(user ? user.role : 'guest')) {
+        const bypass = new Set(['/api/config', '/api/status', '/api/health', '/api/auth/login', '/api/auth/logout', '/api/captcha', '/api/gate']);
+        if (!bypass.has(url.pathname)) {
+          const flag = await env.DB.prepare("SELECT value FROM settings WHERE key = 'maintenance_mode'").first();
+          if (flag && String(flag.value) === '1') {
+            throw new HttpError(503, 'ร้านปิดปรับปรุงชั่วคราว กรุณากลับมาใหม่ภายหลัง', { maintenance: true });
+          }
+        }
+      }
+
       for (const [method, pattern, handler, guard] of routes) {
         if (request.method !== method) continue;
         const match = pattern.exec(url.pathname);
         if (!match) continue;
-        if (url.pathname.startsWith('/api/admin/')) requireStaff(context);
-        if (guard) guard(context);
+        if (url.pathname.startsWith('/api/admin/')) await requireStaff(context);
+        if (guard) await guard(context);
         const response = await handler(context, match[1], match[2]);
         return withSecurityHeaders(response);
       }
@@ -2229,6 +3325,17 @@ export default {
         if (error.extra && error.extra.retryAfter) headers['retry-after'] = String(error.extra.retryAfter);
         const body = { error: error.message };
         if (error.extra && error.extra.gateRequired) body.gateRequired = true;
+        if (error.extra && error.extra.maintenance) body.maintenance = true;
+        // Fraud: การยิง API ถี่ผิดปกติ (บันทึกพร้อม IP แต่ไม่ตัดสินจาก IP อย่างเดียว)
+        if (error.status === 429) {
+          await recordFraud(env.DB, {
+            type: 'api_flood',
+            risk: 'medium',
+            description: `ถูกจำกัดคำขอ: ${url.pathname}`,
+            evidence: { path: url.pathname, method: request.method, retryAfter: error.extra?.retryAfter || 0 },
+            ip: clientIp(request),
+          });
+        }
         return withSecurityHeaders(json(body, error.status, headers));
       }
       console.error('UNHANDLED', error && error.stack ? error.stack : error);

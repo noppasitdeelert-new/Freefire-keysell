@@ -1,11 +1,17 @@
 import { hashPassword, randomHex } from './security.js';
+import { ADMIN_ROLES, PERMISSIONS, ROLE_PERMISSIONS } from './perms.js';
 
 export const ROLES = {
-  owner: { rank: 1, label: 'Owner' },
+  owner: { rank: 1, label: 'Owner (Super Admin)' },
   admin: { rank: 2, label: 'Admin' },
-  dealer: { rank: 3, label: 'ตัวแทน/ตัวขาย' },
-  member: { rank: 4, label: 'Member' },
+  moderator: { rank: 3, label: 'Moderator' },
+  support: { rank: 4, label: 'Support' },
+  dealer: { rank: 5, label: 'ตัวแทน/ตัวขาย' },
+  member: { rank: 6, label: 'Member' },
 };
+
+/** ยศที่ถือเป็นทีมงาน (เห็นหลังบ้าน) */
+export const STAFF_ROLES = ['owner', 'admin', 'moderator', 'support'];
 
 export const BRAND = 'VEXIS';
 export const BRAND_FULL = 'VEXIS KEY STORE';
@@ -196,6 +202,210 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_topups_user ON topups (user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_topups_status ON topups (status)`,
   `CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets (user_id)`,
+
+  /* ---------- VEXIS ULTIMATE: ระบบใหม่ (ตารางเพิ่มแบบไม่แตะข้อมูลเดิม) ---------- */
+  `CREATE TABLE IF NOT EXISTS referral_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    code TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS referral_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL DEFAULT 'แคมเปญเชิญเพื่อน',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    signup_reward REAL NOT NULL DEFAULT 0,
+    purchase_reward REAL NOT NULL DEFAULT 0,
+    reward_type TEXT NOT NULL DEFAULT 'credit',
+    max_rewards INTEGER NOT NULL DEFAULT 0,
+    starts_at TEXT NOT NULL DEFAULT '',
+    ends_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS referral_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer_id INTEGER NOT NULL,
+    referee_id INTEGER NOT NULL,
+    campaign_id INTEGER,
+    kind TEXT NOT NULL DEFAULT 'signup',
+    amount REAL NOT NULL DEFAULT 0,
+    reward_type TEXT NOT NULL DEFAULT 'credit',
+    status TEXT NOT NULL DEFAULT 'credited',
+    ip TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS order_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS wishlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS wishlist_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wishlist_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    price_at_add REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS email_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    to_email TEXT NOT NULL DEFAULT '',
+    event TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    provider TEXT NOT NULL DEFAULT '',
+    provider_id TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS translation_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    locale TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    native_label TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS translation_strings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    locale TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS fraud_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    event_type TEXT NOT NULL,
+    risk TEXT NOT NULL DEFAULT 'low',
+    description TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    ip TEXT NOT NULL DEFAULT '',
+    review_status TEXT NOT NULL DEFAULT 'open',
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS fraud_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL,
+    actor_id INTEGER,
+    action TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS system_incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'minor',
+    status TEXT NOT NULL DEFAULT 'investigating',
+    body TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS health_check_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service TEXT NOT NULL,
+    status TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS admin_roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    rank INTEGER NOT NULL DEFAULT 9,
+    permissions TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS admin_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    group_name TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE TABLE IF NOT EXISTS admin_role_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    role_key TEXT NOT NULL,
+    granted_by INTEGER,
+    granted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    revoked_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS admin_permission_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    permission TEXT NOT NULL,
+    allow INTEGER NOT NULL DEFAULT 1,
+    granted_by INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_tx_unique ON referral_transactions (referrer_id, referee_id, kind)`,
+  `CREATE INDEX IF NOT EXISTS idx_referral_tx_referrer ON referral_transactions (referrer_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_wishlist_items_unique ON wishlist_items (wishlist_id, product_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_status_history (order_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_email_logs_created ON email_logs (created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_fraud_events_status ON fraud_events (review_status, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_fraud_events_user ON fraud_events (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_health_logs_service ON health_check_logs (service, created_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_translation_strings_unique ON translation_strings (locale, key)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_perm_unique ON admin_permission_assignments (user_id, permission)`,
+
+  /* ---------- TrueMoney Gift Envelope & Wallet Ledger ---------- */
+  `CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    balance_before REAL NOT NULL DEFAULT 0,
+    balance_after REAL NOT NULL DEFAULT 0,
+    ref_type TEXT NOT NULL DEFAULT '',
+    ref_id INTEGER,
+    note TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    actor_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS gift_envelope_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topup_id INTEGER,
+    voucher_code TEXT NOT NULL UNIQUE,
+    phone TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    source TEXT NOT NULL DEFAULT 'none',
+    raw_response TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS topup_verifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topup_id INTEGER NOT NULL,
+    actor_id INTEGER,
+    actor_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    amount REAL NOT NULL DEFAULT 0,
+    evidence TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_transactions (user_id, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_topup_verifications_topup ON topup_verifications (topup_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gift_envelope_status ON gift_envelope_transactions (status)`,
 ];
 
 const SEED_SETTINGS = [
@@ -257,6 +467,42 @@ export async function syncStock(db, productId) {
     )
     .bind(productId, productId)
     .run();
+}
+
+async function seedUltimate(db) {
+  // บทบาทแอดมิน + แคตตาล็อกสิทธิ์ (ค่าตั้งต้นตามสเปก)
+  for (const [key, meta] of Object.entries(ADMIN_ROLES)) {
+    await db
+      .prepare('INSERT INTO admin_roles (key, name, rank, permissions) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO NOTHING')
+      .bind(key, meta.label, meta.rank, JSON.stringify(ROLE_PERMISSIONS[key] || []))
+      .run();
+  }
+  for (const [key, label] of Object.entries(PERMISSIONS)) {
+    await db
+      .prepare('INSERT INTO admin_permissions (key, label, group_name) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING')
+      .bind(key, label, key.split('.')[0])
+      .run();
+  }
+
+  // แคมเปญเชิญเพื่อนเริ่มต้น: ปิดไว้และรางวัล 0 → แอดมินต้องตั้งเองก่อนจึงจะจ่ายรางวัล
+  const campaign = await db.prepare('SELECT id FROM referral_campaigns LIMIT 1').first();
+  if (!campaign) {
+    await db
+      .prepare(
+        `INSERT INTO referral_campaigns (name, enabled, signup_reward, purchase_reward, reward_type, max_rewards)
+         VALUES ('แคมเปญเชิญเพื่อน VEXIS', 0, 0, 0, 'credit', 0)`,
+      )
+      .run();
+  }
+
+  await db.batch([
+    db.prepare(
+      "INSERT INTO translation_settings (locale, label, native_label, enabled, is_default) VALUES ('th', 'Thai', 'ไทย', 1, 1) ON CONFLICT(locale) DO NOTHING",
+    ),
+    db.prepare(
+      "INSERT INTO translation_settings (locale, label, native_label, enabled, is_default) VALUES ('en', 'English', 'English', 1, 0) ON CONFLICT(locale) DO NOTHING",
+    ),
+  ]);
 }
 
 async function seed(db) {
@@ -403,7 +649,7 @@ async function migrateCatalog(db) {
 
 export function initDb(env) {
   if (!initPromise) {
-    initPromise = (async () => {
+    const run = async () => {
       const db = env.DB;
       await db.batch(SCHEMA.map((sql) => db.prepare(sql)));
       // รองรับระยะเวลาการใช้งานของสินค้าในฐานข้อมูลเดิม โดยไม่รีเซ็ตข้อมูล
@@ -413,7 +659,40 @@ export function initDb(env) {
       // ส่วนลดคูปองที่ใช้กับออเดอร์ (ออเดอร์เดิมได้ค่าเริ่มต้นเป็น 0)
       await addColumnIfMissing(db, 'orders', 'coupon_code', "coupon_code TEXT NOT NULL DEFAULT ''");
       await addColumnIfMissing(db, 'orders', 'discount', 'discount REAL NOT NULL DEFAULT 0');
+
+      // VEXIS ULTIMATE — คอลัมน์เพิ่มเติมสำหรับระบบใหม่ (ค่าเริ่มต้นไม่กระทบข้อมูลเดิม)
+      await addColumnIfMissing(db, 'users', 'email', "email TEXT NOT NULL DEFAULT ''");
+      await addColumnIfMissing(db, 'users', 'email_verified', 'email_verified INTEGER NOT NULL DEFAULT 0');
+      await addColumnIfMissing(db, 'users', 'locale', "locale TEXT NOT NULL DEFAULT 'th'");
+      await addColumnIfMissing(db, 'users', 'online_at', 'online_at TEXT');
+      await addColumnIfMissing(db, 'users', 'referred_by', 'referred_by INTEGER');
+      await addColumnIfMissing(db, 'users', 'restricted', 'restricted INTEGER NOT NULL DEFAULT 0');
+      await addColumnIfMissing(db, 'users', 'points', 'points INTEGER NOT NULL DEFAULT 0');
+      await addColumnIfMissing(db, 'users', 'restriction_reason', "restriction_reason TEXT NOT NULL DEFAULT ''");
+      await addColumnIfMissing(db, 'orders', 'payment_status', "payment_status TEXT NOT NULL DEFAULT 'paid'");
+      await addColumnIfMissing(db, 'orders', 'delivery_status', "delivery_status TEXT NOT NULL DEFAULT 'delivered'");
+      await addColumnIfMissing(db, 'orders', 'refunded_total', 'refunded_total REAL NOT NULL DEFAULT 0');
+
+      // TrueMoney Gift Envelope — คอลัมน์สำหรับตรวจสอบยอดจริง/กันซ้ำ (ค่าเริ่มต้นไม่กระทบรายการเดิม)
+      await addColumnIfMissing(db, 'topups', 'voucher_code', "voucher_code TEXT NOT NULL DEFAULT ''");
+      await addColumnIfMissing(db, 'topups', 'verification_source', "verification_source TEXT NOT NULL DEFAULT 'none'");
+      await addColumnIfMissing(db, 'topups', 'idempotency_key', "idempotency_key TEXT NOT NULL DEFAULT ''");
+      await addColumnIfMissing(db, 'topups', 'declared_amount', 'declared_amount REAL NOT NULL DEFAULT 0');
+      await addColumnIfMissing(db, 'topups', 'balance_before', 'balance_before REAL NOT NULL DEFAULT 0');
+      await addColumnIfMissing(db, 'topups', 'balance_after', 'balance_after REAL NOT NULL DEFAULT 0');
+      await db
+        .prepare(
+          "CREATE INDEX IF NOT EXISTS idx_topups_voucher ON topups (voucher_code) WHERE voucher_code <> ''",
+        )
+        .run();
+      await db
+        .prepare(
+          "CREATE UNIQUE INDEX IF NOT EXISTS idx_topups_idempotency ON topups (user_id, idempotency_key) WHERE idempotency_key <> ''",
+        )
+        .run();
+
       await seed(db);
+      await seedUltimate(db);
       await migrateBrand(db);
       await migrateBrandV3(db);
       await migrateCatalog(db);
@@ -438,6 +717,15 @@ export function initDb(env) {
         db.prepare('DELETE FROM ip_bans WHERE banned_until < ?').bind(now - 7 * 24 * 60 * 60 * 1000),
         db.prepare('DELETE FROM rate_limits WHERE reset_at < ?').bind(now - 60 * 60 * 1000),
       ]);
+    };
+    initPromise = (async () => {
+      try {
+        await run();
+      } catch (first) {
+        // D1 สะดุดชั่วคราว (โควตา/คิวพร้อมกัน) ไม่ควรทำให้ทั้งเว็บขึ้นหน้า error
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await run();
+      }
     })().catch((err) => {
       initPromise = null;
       throw err;

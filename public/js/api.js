@@ -11,36 +11,46 @@ export async function api(path, { method = 'GET', body, timeout = 20000 } = {}) 
     payload = JSON.stringify(body);
     if (payload.length > MAX_BODY) throw new Error('ข้อมูลที่ส่งมีขนาดใหญ่เกินกำหนด');
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(`/api${path}`, {
-      method,
-      credentials: 'same-origin',
-      headers: payload === undefined ? { accept: 'application/json' } : { 'content-type': 'application/json', accept: 'application/json' },
-      body: payload,
-      signal: controller.signal,
-    });
-    let data = null;
+  for (let attempt = 0; ; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
     try {
-      data = await res.json();
-    } catch {
-      data = null;
+      const res = await fetch(`/api${path}`, {
+        method,
+        credentials: 'same-origin',
+        headers: payload === undefined ? { accept: 'application/json' } : { 'content-type': 'application/json', accept: 'application/json' },
+        body: payload,
+        signal: controller.signal,
+      });
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+      if (!res.ok) {
+        // คำขออ่านข้อมูลที่ถูกจำกัดความถี่ชั่วคราว → รอตามเวลาที่เซิร์ฟเวอร์บอกแล้วลองใหม่หนึ่งครั้ง
+        if (res.status === 429 && method === 'GET' && attempt < 1) {
+          const retryAfter = Number(res.headers.get('retry-after') || 0);
+          const waitMs = Math.min(5000, (retryAfter > 0 ? retryAfter : 2) * 1000);
+          clearTimeout(timer);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+        if (res.status === 401 && unauthorizedHandler) unauthorizedHandler();
+        const error = new Error((data && data.error) || `เกิดข้อผิดพลาด (${res.status})`);
+        error.status = res.status;
+        error.data = data;
+        throw error;
+      }
+      return data;
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error('การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่');
+      if (err instanceof TypeError) throw new Error('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ต');
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    if (!res.ok) {
-      if (res.status === 401 && unauthorizedHandler) unauthorizedHandler();
-      const error = new Error((data && data.error) || `เกิดข้อผิดพลาด (${res.status})`);
-      error.status = res.status;
-      error.data = data;
-      throw error;
-    }
-    return data;
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่');
-    if (err instanceof TypeError) throw new Error('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ต');
-    throw err;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -126,6 +136,18 @@ export function statusPill(status) {
     active: ['เปิดใช้งาน', 'pill-approved'],
     suspended: ['ระงับ/ค้างชำระ', 'pill-pending'],
     revoked: ['ถูกปลด', 'pill-rejected'],
+    paid: ['ชำระแล้ว', 'pill-approved'],
+    unpaid: ['รอชำระ', 'pill-pending'],
+    delivered: ['ส่งมอบแล้ว', 'pill-approved'],
+    processing: ['กำลังดำเนินการ', 'pill-pending'],
+    created: ['สร้างคำสั่งซื้อ', 'pill-open'],
+    key_assigned: ['มอบคีย์แล้ว', 'pill-approved'],
+    refunded: ['คืนเงินแล้ว', 'pill-rejected'],
+    sent: ['ส่งแล้ว', 'pill-approved'],
+    failed: ['ส่งไม่สำเร็จ', 'pill-rejected'],
+    not_configured: ['ยังไม่ตั้งค่า', 'pill-pending'],
+    skipped: ['ข้าม', 'pill-open'],
+    disabled: ['ปิดใช้งาน', 'pill-open'],
   };
   const [label, cls] = map[status] || [status, 'pill-open'];
   return `<span class="pill ${cls}">${escapeHtml(label)}</span>`;

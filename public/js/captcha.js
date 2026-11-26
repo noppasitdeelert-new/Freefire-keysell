@@ -41,6 +41,15 @@ export async function mountCaptcha(container, config) {
 
 async function loadTurnstile() {
   if (window.turnstile) return;
+  // โหลดสคริปต์ Turnstile เมื่อตั้งค่า site key แล้วเท่านั้น (ไม่โหลดทิ้งไว้ตอนยังไม่ตั้งค่า)
+  if (!document.querySelector('script[data-turnstile-sdk]')) {
+    const script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    script.async = true;
+    script.defer = true;
+    script.dataset.turnstileSdk = '1';
+    document.head.appendChild(script);
+  }
   await new Promise((resolve, reject) => {
     const started = Date.now();
     const tick = () => {

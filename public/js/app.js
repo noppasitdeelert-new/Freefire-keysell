@@ -9,8 +9,10 @@ import {
   roleBadge,
   formatDate,
   onUnauthorized,
-} from './api.js?v=11';
-import { mountCaptcha, captchaPayload } from './captcha.js';
+} from './api.js?v=19';
+import { mountCaptcha, captchaPayload } from './captcha.js?v=19';
+import { initI18n, t, languageSwitcher, setLocale, currentLocale } from './i18n.js?v=18';
+import { renderReferral, renderWishlist, renderOrders, renderStatus, renderWallet } from './pages.js?v=18';
 
 const app = document.getElementById('app');
 
@@ -32,7 +34,7 @@ const state = {
 /* ------------------------------------------------------------------ */
 
 function isStaff() {
-  return state.me && state.me.rank <= 2;
+  return state.me && state.me.rank <= 4;
 }
 
 function discordUrl() {
@@ -44,11 +46,15 @@ function discordButton(cls = 'btn btn-discord', label = 'เข้าร่ว�
 }
 
 function navItems(me) {
-  const items = [['#/', 'ร้านค้า', ''], ['#/topup', 'เติมเงิน', 'topup']];
-  if (me) items.push(['#/account', 'บัญชีของฉัน', 'account']);
-  if (me) items.push(['#/reseller', 'ตัวแทน/API', 'reseller']);
-  if (me) items.push(['#/support', 'ซัพพอร์ต', 'support']);
-  if (isStaff()) items.push(['#/admin', 'หลังบ้าน', 'admin']);
+  const items = [['#/', t('nav.store'), ''], ['#/topup', t('nav.topup'), 'topup']];
+  if (me) items.push(['#/wallet', t('nav.wallet'), 'wallet']);
+  if (me) items.push(['#/orders', t('nav.orders'), 'orders']);
+  if (me) items.push(['#/wishlist', t('nav.wishlist'), 'wishlist']);
+  if (me) items.push(['#/account', t('nav.account'), 'account']);
+  if (me) items.push(['#/referral', t('nav.referral'), 'referral']);
+  if (me) items.push(['#/reseller', t('nav.reseller'), 'reseller']);
+  if (me) items.push(['#/support', t('nav.support'), 'support']);
+  if (isStaff()) items.push(['#/admin', t('nav.admin'), 'admin']);
   return items;
 }
 
@@ -67,6 +73,7 @@ function topbar() {
         ${navItems(me).map(([href, label, key]) => navItem(href, label, key)).join('')}
       </nav>
       <div class="topbar-actions">
+        ${languageSwitcher()}
         <span class="live-chip" id="live-chip" title="ข้อมูลร้านอัปเดตเรียลไทม์">● LIVE</span>
         <a class="discord-chip" href="${discordUrl()}" target="_blank" rel="noopener noreferrer" title="เข้าร่วมกับเรา Discord" aria-label="เข้าร่วมกับเรา Discord">💬 <span>Discord</span></a>
         ${
@@ -90,7 +97,7 @@ function topbar() {
 }
 
 function mobileMenu(me) {
-  const icons = { '': '🏠', topup: '💳', account: '👤', reseller: '🤝', support: '💬', admin: '🛠️' };
+  const icons = { '': '🏠', topup: '💳', wallet: '💰', account: '👤', orders: '📦', wishlist: '💜', referral: '🎁', reseller: '🤝', support: '💬', admin: '🛠️' };
   const links = navItems(me)
     .map(
       ([href, label, key]) =>
@@ -117,6 +124,10 @@ function mobileMenu(me) {
         </div>
       </div>
       <nav class="mobile-nav">${links}</nav>
+      <div class="row between" style="margin-top:10px">
+        <span class="tiny muted">${t('common.language')}</span>
+        ${languageSwitcher()}
+      </div>
       <a class="btn btn-discord btn-block" href="${discordUrl()}" target="_blank" rel="noopener noreferrer" style="margin-top:10px">💬 เข้าร่วมกับเรา Discord</a>
       <div class="spacer"></div>
       ${
@@ -156,6 +167,7 @@ function footer() {
           <a href="#/faq">คำถามที่พบบ่อย</a>
           <a href="#/terms">เงื่อนไขการใช้บริการ</a>
           <a href="#/privacy">นโยบายความเป็นส่วนตัว</a>
+          <a href="#/status">${t('nav.status')}</a>
         </nav>
         <div style="margin-top:10px">${discordButton('discord-chip')}</div>
       </div>
@@ -174,27 +186,46 @@ function shell(content) {
 
 /* เปลี่ยนเฉพาะเนื้อหาหน้า โดยไม่สร้าง top bar ใหม่ทั้งก้อน
    ทำให้กดเมนูแล้วไม่กระพริบ/ไม่รีหน้า */
+let topbarSignature = '';
+
+function renderTopbar() {
+  const top = document.getElementById('topbar-root');
+  if (!top) return;
+  const me = state.me;
+  const signature = `${me ? `${me.id}:${me.balance}:${me.rank}:${me.roleLabel}` : 'guest'}|${currentLocale()}|${state.route}`;
+  if (signature === topbarSignature) return;
+  topbarSignature = signature;
+  top.innerHTML = topbar();
+}
+
 function setPage(content) {
   const main = document.getElementById('main-root');
   if (!main) {
     app.innerHTML = shell(content);
+    topbarSignature = '';
     return;
   }
-  main.innerHTML = content;
-  const top = document.getElementById('topbar-root');
-  if (top) top.innerHTML = topbar();
+  const isLoading = typeof content === 'string' && content.includes('data-loading="1"');
+  if (isLoading && main.firstElementChild) {
+    // มีหน้าเดิมแสดงอยู่แล้ว — คงเนื้อหาเดิมไว้ ไม่ต้องกลายเป็นสปินเนอร์ทั้งหน้า
+    main.classList.add('page-loading');
+  } else {
+    main.classList.remove('page-loading');
+    main.innerHTML = content;
+  }
+  renderTopbar();
 }
 
 function loader() {
-  return `<div class="page"><div class="loader"><div class="spinner"></div></div></div>`;
+  return `<div class="page" data-loading="1"><div class="loader"><div class="spinner"></div></div></div>`;
 }
 
-function errorState(message, { retry = false } = {}) {
-  return `<div class="page"><div class="card center" style="max-width:440px;margin:60px auto">
+function errorState(message, { retry = false, auto = false } = {}) {
+  return `<div class="page error-state"><div class="card center" style="max-width:440px;margin:60px auto">
     <h3>เกิดข้อผิดพลาด</h3>
     <p class="muted small" style="margin:8px 0 18px">${escapeHtml(message)}</p>
     ${retry ? '<button class="btn btn-primary" type="button" data-retry>ลองใหม่อีกครั้ง</button>' : '<a class="btn btn-primary" href="#/">กลับหน้าแรก</a>'}
-    <p class="tiny muted" style="margin-top:12px">ถ้ายังขึ้นซ้ำ ลองปิดแล้วเปิดหน้าเว็บใหม่ หรือรอสักครู่แล้วกดลองใหม่</p>
+    <p class="tiny muted" style="margin-top:12px">${auto ? 'ระบบกำลังเชื่อมต่อใหม่อัตโนมัติ ไม่ต้องกดอะไรก็ได้' : 'ถ้ายังขึ้นซ้ำ ลองปิดแล้วเปิดหน้าเว็บใหม่ หรือรอสักครู่แล้วกดลองใหม่'}</p>
   </div></div>`;
 }
 
@@ -300,9 +331,12 @@ function productCard(p) {
       }
       <div class="product-meta">
         <span class="stock-badge ${p.soldOut ? 'out' : ''}" data-stock>คงเหลือ <b>${p.stock}</b> ชิ้น</span>
-        <button class="btn btn-sm ${p.soldOut ? 'btn-ghost' : 'btn-primary'}" ${
-          p.soldOut ? 'disabled' : ''
-        } data-buy="${p.id}">${p.soldOut ? 'สินค้าหมด' : 'ซื้อเลย'}</button>
+        <div class="row" style="gap:6px">
+          <button class="btn btn-sm btn-ghost" data-wish="${p.id}" title="${t('nav.wishlist')}" aria-label="${t('nav.wishlist')}">♡</button>
+          <button class="btn btn-sm ${p.soldOut ? 'btn-ghost' : 'btn-primary'}" ${
+            p.soldOut ? 'disabled' : ''
+          } data-buy="${p.id}">${p.soldOut ? 'สินค้าหมด' : 'ซื้อเลย'}</button>
+        </div>
       </div>
     </article>`;
 }
@@ -727,10 +761,13 @@ async function renderLogin() {
 
 async function renderRegister() {
   setRoute('register');
+  const rawQuery = location.hash.split('?')[1] || '';
+  const refCode = (new URLSearchParams(rawQuery).get('ref') || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   setPage(authShell(`
     <div class="card auth-card">
       <h1>สมัครสมาชิก</h1>
       <p class="sub">สมัครฟรี เริ่มต้นที่ยศ Member — ซื้อสินค้าและเติมเงินได้ทันที</p>
+      ${refCode ? `<div class="notice" style="margin-bottom:12px">🎁 คุณมาพร้อมรหัสเชิญ <strong>${escapeHtml(refCode)}</strong> — สมัครเสร็จเพื่อนของคุณจะได้รางวัล</div>` : ''}
       <form data-form="register" class="stack" novalidate>
         <div class="field">
           <label for="reg-username">ชื่อผู้ใช้</label>
@@ -745,8 +782,16 @@ async function renderRegister() {
           <input class="input" id="reg-password2" name="password2" type="password" autocomplete="new-password" maxlength="72" required placeholder="พิมพ์รหัสผ่านอีกครั้ง" />
         </div>
         <div class="field">
+          <label for="reg-email">อีเมล (ไม่บังคับ — ใช้รับการแจ้งเตือน)</label>
+          <input class="input" id="reg-email" name="email" type="email" maxlength="120" placeholder="you@example.com" />
+        </div>
+        <div class="field">
           <label for="reg-contact">ช่องทางติดต่อ (ไม่บังคับ)</label>
           <input class="input" id="reg-contact" name="contact" maxlength="60" placeholder="LINE ID / เบอร์โทร" />
+        </div>
+        <div class="field">
+          <label for="reg-ref">รหัสเชิญเพื่อน (ไม่บังคับ)</label>
+          <input class="input" id="reg-ref" name="ref" maxlength="16" value="${escapeHtml(refCode)}" placeholder="รหัส 8 ตัวจากเพื่อน" />
         </div>
         <div id="captcha-slot"></div>
         <div class="form-error" data-error></div>
@@ -779,12 +824,14 @@ async function renderRegister() {
         body: {
           username: form.username.value.trim(),
           password: form.password.value,
+          email: form.email.value.trim(),
           contact: form.contact.value.trim(),
+          ref: form.ref.value.trim().toUpperCase(),
           ...captchaPayload(captchaSlot),
         },
       });
       state.me = res.user;
-      toast('สมัครสมาชิกสำเร็จ ยินดีต้อนรับ!', 'success');
+      toast(res.referralApplied ? 'สมัครสมาชิกสำเร็จ — ใช้รหัสเชิญแล้ว!' : 'สมัครสมาชิกสำเร็จ ยินดีต้อนรับ!', 'success');
       location.hash = '#/';
     } catch (err) {
       errorEl.textContent = err.message;
@@ -802,40 +849,78 @@ async function renderRegister() {
 /* top-up                                                              */
 /* ------------------------------------------------------------------ */
 
-function topupFormHtml(method) {
+function topupSubmitLabel(method) {
+  return method === 'envelope' ? 'ส่งคำขอเติมเงิน (ตรวจสอบซอง)' : 'ส่งหลักฐานการโอน';
+}
+
+const TOPUP_STATUS = {
+  pending: { label: 'รอตรวจสอบ', cls: 'pill-pending', hint: 'แอดมินกำลังตรวจสอบยอดจริงจากซอง' },
+  verifying: { label: 'กำลังตรวจสอบ', cls: 'pill-pending', hint: 'ระบบ/แอดมินกำลังตรวจสอบยอดจริง' },
+  approved: { label: 'อนุมัติแล้ว', cls: 'pill-approved', hint: 'เครดิตเข้าถูกเพิ่มเข้ากระเป๋าแล้ว' },
+  rejected: { label: 'ปฏิเสธ', cls: 'pill-rejected', hint: 'ไม่ผ่านการตรวจสอบ' },
+  expired: { label: 'ซองหมดอายุ', cls: 'pill-rejected', hint: 'ซองเกิน 72 ชั่วโมง' },
+  duplicate: { label: 'รายการซ้ำ', cls: 'pill-rejected', hint: 'ซองนี้ถูกใช้ในระบบแล้ว' },
+};
+
+function topupStatusPill(status) {
+  const meta = TOPUP_STATUS[status] || { label: status, cls: 'pill-open' };
+  return `<span class="pill ${meta.cls}">${escapeHtml(meta.label)}</span>`;
+}
+
+/** คิดค่าธรรมเนียมแบบสตางค์ทั้งหมด (ไม่มีความคลาดเคลื่อน) — ฝั่งเซิร์ฟเวอร์คิดซ้ำเสมอ */
+function feeSplit(baht) {
+  const satang = Math.max(0, Math.round((Number(baht) || 0) * 100));
+  const feeSatang = Math.round((satang * Math.round(Number(state.config?.feePercent || 3) * 100)) / 10000);
+  const netSatang = Math.max(0, satang - feeSatang);
+  return { amount: satang / 100, fee: feeSatang / 100, net: netSatang / 100 };
+}
+
+function topupFormHtml(method, phone) {
   const isEnvelope = method === 'envelope';
+  const preset = feeSplit(100);
   return `
     <form data-form="topup" class="stack" novalidate>
       <div class="field">
-        <label>จำนวนเงินที่ต้องการเติม (บาท)</label>
-        <div class="amount-presets">
+        <label>${isEnvelope ? 'ยอดเงินในซอง (บาท)' : 'ยอดที่โอน (บาท)'}</label>
+        <input class="input" name="amount" type="number" min="20" max="10000" step="0.01" value="100" required />
+        <div class="chips" style="margin-top:8px">
           ${[50, 100, 300, 500, 1000]
-            .map((v) => `<button type="button" data-amount="${v}">฿${v.toLocaleString('th-TH')}</button>`)
+            .map((v) => `<button type="button" class="chip" data-amount="${v}">฿${v.toLocaleString('th-TH')}</button>`)
             .join('')}
         </div>
-        <input class="input" name="amount" type="number" min="20" max="10000" step="1" value="100" required inputmode="numeric" />
-        <span class="field-hint">ขั้นต่ำ 20 บาท · สูงสุด 10,000 บาท ต่อรายการ</span>
+        <span class="field-hint">${
+          isEnvelope
+            ? 'ระบบใช้<b>ยอดจริงในซอง</b>เป็นหลัก ยอดนี้ใช้เป็นข้อมูลอ้างอิงเท่านั้น'
+            : 'ขั้นต่ำ 20 บาท · สูงสุด 10,000 บาท ต่อรายการ'
+        }</span>
       </div>
+
       <div class="field">
-        <label>${isEnvelope ? 'ลิงก์ซองทรู (อั่งเปา)' : 'เลขอ้างอิง / หลักฐานการโอน'}</label>
+        <label>${isEnvelope ? 'ลิงก์ซองของขวัญ TrueMoney' : 'เลขอ้างอิง / หลักฐานการโอน'}</label>
         <input class="input" name="reference" maxlength="300" required placeholder="${
           isEnvelope ? 'https://gift.truemoney.com/campaign/?v=…' : 'เช่น REF-2024-XXXX หรือเลขสลิป'
         }" />
         <span class="field-hint">${
-          isEnvelope ? 'วางลิงก์ซองทรูที่ส่งเข้าซองของร้านเท่านั้น' : 'แนบเลขอ้างอิงที่ใช้โอน เพื่อให้แอดมินตรวจสอบ'
+          isEnvelope
+            ? `วางลิงก์ซองที่ส่งมาให้ร้าน ระบบส่งต่อไปยังเบอร์รับซองของร้านเพื่อตรวจยอดจริง (หักค่าธรรมเนียม ${state.config.feePercent}%)`
+            : 'แนบเลขอ้างอิงที่ใช้โอน เพื่อให้แอดมินตรวจสอบ'
         }</span>
       </div>
+
       <div class="field">
         <label>หมายเหตุ (ไม่บังคับ)</label>
         <input class="input" name="note" maxlength="200" placeholder="เช่น โอนเมื่อ 14:20" />
       </div>
+
       <div class="fee-preview">
-        <div class="line"><span>ยอดแจ้งเติม</span><span data-fee-amount>${money(100)}</span></div>
-        <div class="line"><span>ค่าธรรมเนียม ${state.config.feePercent}%</span><span data-fee-fee>-${money(3)}</span></div>
-        <div class="line total"><span>เครดิตที่ได้รับจริง</span><span data-fee-net>${money(97)}</span></div>
+        <div class="line"><span>ยอดเงินจริงจากซอง</span><span data-fee-amount>${money(preset.amount)}</span></div>
+        <div class="line"><span>ค่าธรรมเนียม ${state.config.feePercent}%</span><span data-fee-fee>-${money(preset.fee)}</span></div>
+        <div class="line total"><span>เครดิตที่จะได้รับ</span><span data-fee-net>${money(preset.net)}</span></div>
       </div>
+
       <div class="form-error" data-error></div>
-      <button class="btn btn-primary btn-block" type="submit" data-submit>แจ้งเติมเงิน</button>
+      <button class="btn btn-primary btn-block" type="submit" data-submit>${topupSubmitLabel(method)}</button>
+      <p class="tiny muted center" style="margin:0">หนึ่งซองเพิ่มเครดิตได้ครั้งเดียว · ระบบไม่รับ PIN/OTP/รหัสผ่าน TrueMoney ของคุณ</p>
     </form>`;
 }
 
@@ -855,26 +940,35 @@ async function renderTopup() {
     return;
   }
   const cfg = state.config;
-  // ข้อมูลรับเงินส่งมาพร้อมคำขอนี้ (ต้องเข้าสู่ระบบแล้วเท่านั้น)
   const pay = data.payment || { ticketPhone: cfg.ticketPhone, bank: cfg.bank, note: cfg.topupNote };
+  const verification = data.verification || { configured: false, message: '' };
   let method = 'envelope';
 
-  // สถานะคำขอเติมเงินล่าสุด — อัปเดตอัตโนมัติเมื่อแอดมินตรวจสอบเสร็จ
   const latest = data.topups[0];
-  const pendingCount = data.topups.filter((t) => t.status === 'pending').length;
+  const pendingCount = data.topups.filter((t) => ['pending', 'verifying'].includes(t.status)).length;
   let statusBanner = '';
   if (latest) {
-    if (latest.status === 'pending') {
-      statusBanner = `<div class="note-box" style="margin-bottom:14px">
-        ⏳ คำขอเติมเงิน ${money(latest.amount)} (${latest.method === 'envelope' ? 'ซองทรู' : 'โอนธนาคาร'}) กำลังตรวจสอบ${pendingCount > 1 ? ` · รอตรวจทั้งหมด ${pendingCount} รายการ` : ''} — เมื่อยืนยันยอดแล้วเครดิตจะเข้าอัตโนมัติและหน้านี้จะอัปเดตเอง
+    const meta = TOPUP_STATUS[latest.status] || { label: latest.status, cls: 'pill-open', hint: '' };
+    const tone =
+      latest.status === 'approved'
+        ? 'border-color:rgba(47,208,127,0.4);color:#7ff0b5'
+        : latest.status === 'pending' || latest.status === 'verifying'
+          ? ''
+          : 'border-color:rgba(255,80,100,0.4);color:#ff9fb0';
+    if (latest.status === 'approved') {
+      statusBanner = `<div class="note-box" style="margin-bottom:14px;${tone}">
+        ✅ อนุมัติแล้ว · ยอดจริง ${money(latest.amount)} — ค่าธรรมเนียม ${money(latest.fee)} — <strong>เข้าเครดิต ${money(latest.net)}</strong>
+        ${latest.auto ? '<br><span style="color:#9fe8c4">ตรวจสอบซองอัตโนมัติและเติมเครดิตแล้ว</span>' : `<br><span style="color:#9fe8c4">แอดมินยืนยันยอดเมื่อ ${formatDate(latest.reviewedAt)}</span>`}
       </div>`;
-    } else if (latest.status === 'approved') {
-      statusBanner = `<div class="note-box" style="margin-bottom:14px;border-color:rgba(47,208,127,0.4);color:#7ff0b5">
-        ✅ เติมเงิน ${money(latest.amount)} สำเร็จ — หักค่าธรรมเนียม ${money(latest.fee)} เข้าเครดิต ${money(latest.net)}
+    } else if (latest.status === 'pending' || latest.status === 'verifying') {
+      statusBanner = `<div class="note-box" style="margin-bottom:14px;${tone}">
+        ⏳ รายการล่าสุด ${money(latest.declaredAmount || latest.amount)} · ${meta.label}${pendingCount > 1 ? ` · รอตรวจทั้งหมด ${pendingCount} รายการ` : ''}
+        <br><span class="tiny">${meta.hint} — ยังไม่มีการเพิ่มเครดิตจนกว่าจะยืนยันยอดจริง</span>
       </div>`;
     } else {
-      statusBanner = `<div class="note-box" style="margin-bottom:14px;border-color:rgba(255,80,100,0.4);color:#ff9fb0">
-        ❌ รายการเติมเงิน ${money(latest.amount)} ถูกปฏิเสธ${latest.note ? ` — ${escapeHtml(latest.note)}` : ''} กรุณาตรวจสอบยอดในซอง/สลิปแล้วแจ้งใหม่
+      statusBanner = `<div class="note-box" style="margin-bottom:14px;${tone}">
+        ${meta.label}${latest.note ? ` — ${escapeHtml(latest.note)}` : ''}
+        <br><span class="tiny">หากซองยังไม่ถูกใช้ สามารถสร้างซองใหม่แล้วแจ้งอีกครั้ง</span>
       </div>`;
     }
   }
@@ -884,58 +978,90 @@ async function renderTopup() {
         .map(
           (t) => `<tr>
             <td class="t-nowrap">${formatDate(t.createdAt)}</td>
-            <td>${t.method === 'envelope' ? 'ซองทรู' : 'โอนธนาคาร'}</td>
+            <td class="t-nowrap">#${t.id}</td>
+            <td>${t.method === 'envelope' ? 'ซองทรู' : 'โอนธนาคาร'}${t.voucherCode ? `<div class="tiny muted mono">${escapeHtml(t.voucherCode.slice(0, 12))}…</div>` : ''}</td>
             <td class="t-right">${money(t.amount)}</td>
             <td class="t-right" style="color:#ffb3bd">-${money(t.fee)}</td>
             <td class="t-right" style="color:#7ff0b5;font-weight:700">${money(t.net)}</td>
-            <td>${statusPill(t.status)}</td>
+            <td>${topupStatusPill(t.status)}${t.auto ? '<span class="pill" style="margin-left:6px">อัตโนมัติ</span>' : ''}</td>
           </tr>`,
         )
         .join('')
-    : `<tr><td colspan="6"><div class="empty-state">ยังไม่มีประวัติการเติมเงิน</div></td></tr>`;
+    : `<tr><td colspan="7"><div class="empty-state">ยังไม่มีประวัติการเติมเงิน</div></td></tr>`;
 
   setPage(`
     <div class="page">
       <div class="section-head">
         <div>
+          <span class="eyebrow">WALLET TOP-UP</span>
           <h2 class="page-title">เติมเงินเข้าระบบ</h2>
-          <p>เลือกช่องทาง เติมเครดิตเข้าบัญชี — ระบบหักค่าธรรมเนียม ${cfg.feePercent}% และแสดงยอดรับจริงทุกครั้ง</p>
+          <p>TrueMoney Gift Envelope · ตรวจยอดจริง · หักค่าธรรมเนียม ${cfg.feePercent}%</p>
         </div>
-        <div class="balance-chip">เครดิตคงเหลือ ${money(state.me.balance)}</div>
+        <a class="balance-chip" href="#/wallet">เครดิตคงเหลือ ${money(state.me.balance)}</a>
       </div>
 
       ${statusBanner}
 
       <div class="two-col">
-        <div class="card">
+        <div class="card glow">
           <div class="chips" style="margin-bottom:16px">
-            <button class="chip ${method === 'envelope' ? 'active' : ''}" data-method="envelope">🎁 ซองทรู (อั่งเปา)</button>
+            <button class="chip ${method === 'envelope' ? 'active' : ''}" data-method="envelope">🎁 TrueMoney Gift Envelope</button>
             <button class="chip ${method === 'bank' ? 'active' : ''}" data-method="bank">🏦 โอนธนาคาร</button>
           </div>
+
+          <div class="tm-steps">
+            <div class="tm-step"><span>1</span><div>เข้าสู่ระบบ VEXIS และเลือกเมนูเติมเงิน</div></div>
+            <div class="tm-step"><span>2</span><div>สร้าง/เปิดซองของขวัญ TrueMoney แล้วคัดลอกลิงก์ซอง</div></div>
+            <div class="tm-step"><span>3</span><div>วางลิงก์ในช่องด้านล่าง แล้วกด “ส่งคำขอเติมเงิน”</div></div>
+            <div class="tm-step"><span>4</span><div>ระบบตรวจยอดจริงจากซอง → หัก ${cfg.feePercent}% → เพิ่มเครดิตเข้ากระเป๋า</div></div>
+          </div>
+
           <div id="method-info"></div>
           <div class="divider"></div>
-          <div id="topup-form-wrap">${topupFormHtml(method)}</div>
+          <div id="topup-form-wrap">${topupFormHtml(method, pay.ticketPhone)}</div>
         </div>
 
-        <div class="card">
-          <h3 class="card-title">รายละเอียดการรับเงิน</h3>
-          <div class="kv"><span>เบอร์รับซองทรู</span><span class="mono">${escapeHtml(pay.ticketPhone || '-')}</span></div>
-          <div class="kv"><span>ธนาคาร</span><span>${escapeHtml(pay.bank?.name || '-')}</span></div>
-          <div class="kv"><span>เลขบัญชี</span><span class="mono">${escapeHtml(pay.bank?.account || '-')}</span></div>
-          <div class="kv"><span>ชื่อบัญชี</span><span>${escapeHtml(pay.bank?.holder || '-')}</span></div>
-          <div class="kv"><span>ค่าธรรมเนียม</span><span>${cfg.feePercent}% ต่อรายการ</span></div>
-          <div class="note-box" style="margin-top:14px">
-            ${escapeHtml(pay.note || '')}
+        <div class="stack">
+          <div class="card">
+            <h3 class="card-title">หมายเลขรับซอง</h3>
+            <p class="tiny muted" style="margin-top:2px">แสดงเฉพาะสมาชิกที่เข้าสู่ระบบแล้ว</p>
+            <div class="copy-box locked" style="margin-top:10px">
+              <span class="mono">${escapeHtml(pay.ticketPhone || '-')}</span>
+              <button type="button" data-copy="${escapeHtml(pay.ticketPhone || '')}">คัดลอก</button>
+            </div>
+            <div class="lock-note">🔒 เบอร์นี้ล็อกโดยระบบและไม่แสดงต่อผู้เยี่ยมชมทั่วไป</div>
+
+            <div class="notice" style="margin-top:14px;${verification.configured ? 'border-color:rgba(47,208,127,.35);color:#a8f5ca;background:rgba(47,208,127,.08)' : ''}">
+              <strong>${verification.configured ? 'ตรวจสอบอัตโนมัติ: พร้อมใช้งาน' : 'ตรวจสอบอัตโนมัติ: Not Configured'}</strong>
+              <div class="tiny" style="margin-top:4px">${escapeHtml(verification.message || '')}</div>
+              ${verification.configured ? '' : '<div class="tiny" style="margin-top:4px">คำขอจะถูกบันทึกเป็น “รอตรวจสอบ” และแอดมินจะตรวจยอดจริงก่อนเติมเครดิต — ระบบจะไม่เติมเครดิตอัตโนมัติ</div>'}
+            </div>
           </div>
-          <div class="lock-note" style="margin-top:11px">🔒 ข้อมูลนี้แสดงเฉพาะผู้ที่เข้าสู่ระบบแล้วเท่านั้น</div>
+
+          <div class="card">
+            <h3 class="card-title">ตัวอย่างค่าธรรมเนียม ${cfg.feePercent}%</h3>
+            <div class="kv"><span>ซอง ฿50</span><span>เข้า ฿${feeSplit(50).net.toFixed(2)}</span></div>
+            <div class="kv"><span>ซอง ฿100</span><span>เข้า ฿${feeSplit(100).net.toFixed(2)}</span></div>
+            <div class="kv"><span>ซอง ฿500</span><span>เข้า ฿${feeSplit(500).net.toFixed(2)}</span></div>
+            <div class="kv"><span>ซอง ฿1,000</span><span>เข้า ฿${feeSplit(1000).net.toFixed(2)}</span></div>
+          </div>
+
+          <div class="card">
+            <h3 class="card-title">รายละเอียดการรับเงิน</h3>
+            <div class="kv"><span>ธนาคาร</span><span>${escapeHtml(pay.bank?.name || '-')}</span></div>
+            <div class="kv"><span>เลขบัญชี</span><span class="mono">${escapeHtml(pay.bank?.account || '-')}</span></div>
+            <div class="kv"><span>ชื่อบัญชี</span><span>${escapeHtml(pay.bank?.holder || '-')}</span></div>
+          </div>
         </div>
       </div>
 
       <section class="section">
-        <div class="section-head"><div><h2>ประวัติการเติมเงิน</h2><p>แสดงยอดที่ได้รับและค่าธรรมเนียมที่หักทุกครั้ง</p></div></div>
-        <div class="table-wrap">
+        <div class="section-head"><div><h2>ประวัติการเติมเงิน</h2><p>แสดงยอดจริง ค่าธรรมเนียม และสถานะทุกครั้ง</p></div>
+          <a class="btn btn-sm btn-ghost" href="#/wallet">ดูกระเป๋าเงิน →</a>
+        </div>
+        <div class="table-wrap card" style="padding:0">
           <table>
-            <thead><tr><th>วันที่</th><th>ช่องทาง</th><th class="t-right">ยอดแจ้ง</th><th class="t-right">หัก ${cfg.feePercent}%</th><th class="t-right">รับจริง</th><th>สถานะ</th></tr></thead>
+            <thead><tr><th>วันที่</th><th>รายการ</th><th>ช่องทาง</th><th class="t-right">ยอดจริง</th><th class="t-right">หัก ${cfg.feePercent}%</th><th class="t-right">รับจริง</th><th>สถานะ</th></tr></thead>
             <tbody>${historyRows}</tbody>
           </table>
         </div>
@@ -948,12 +1074,12 @@ async function renderTopup() {
     if (method === 'envelope') {
       info.innerHTML = `
         <div class="field" style="gap:8px">
-          <label>เบอร์รับซองทรู (ล็อกโดยระบบ)</label>
+          <label>เบอร์รับซองของร้าน (ล็อกโดยระบบ)</label>
           <div class="copy-box locked">
-            <span>${escapeHtml(pay.ticketPhone || '-')}</span>
+            <span class="mono">${escapeHtml(pay.ticketPhone || '-')}</span>
             <button type="button" data-copy="${escapeHtml(pay.ticketPhone || '')}">คัดลอก</button>
           </div>
-          <div class="lock-note">🔒 ระบบอนุญาตให้รับซองที่เบอร์นี้เท่านั้น ห้ามแอดหรือเพิ่มเบอร์อื่น — เบอร์นี้ถูกล็อกและแก้ไขไม่ได้</div>
+          <div class="lock-note">🔒 เบอร์นี้ไม่แสดงต่อสาธารณะ และไม่เก็บ PIN/OTP ของคุณ</div>
         </div>`;
     } else {
       info.innerHTML = `
@@ -977,11 +1103,10 @@ async function renderTopup() {
       net: form.querySelector('[data-fee-net]'),
     };
     const recalc = () => {
-      const amount = Math.max(0, Number(amountInput.value) || 0);
-      const fee = Math.round(amount * cfg.feePercent) / 100;
-      preview.amount.textContent = money(amount);
-      preview.fee.textContent = '-' + money(fee);
-      preview.net.textContent = money(amount - fee);
+      const split = feeSplit(amountInput.value);
+      preview.amount.textContent = money(split.amount);
+      preview.fee.textContent = '-' + money(split.fee);
+      preview.net.textContent = money(split.net);
     };
     amountInput.addEventListener('input', recalc);
     recalc();
@@ -999,7 +1124,7 @@ async function renderTopup() {
       const submit = form.querySelector('[data-submit]');
       errorEl.textContent = '';
       submit.disabled = true;
-      submit.textContent = 'กำลังส่งข้อมูล…';
+      submit.textContent = method === 'envelope' ? 'กำลังส่งไปตรวจสอบซอง…' : 'กำลังส่งข้อมูล…';
       try {
         const res = await api('/topups', {
           method: 'POST',
@@ -1008,14 +1133,27 @@ async function renderTopup() {
             amount: Number(amountInput.value),
             reference: form.reference.value.trim(),
             note: form.note.value.trim(),
+            clientToken: `topup-${method}-${Date.now()}`,
           },
         });
-        toast(res.message, 'success', 6000);
+        if (res.auto) {
+          if (state.me && res.balance !== undefined) {
+            state.me.balance = Number(String(res.balance).replace(/[^\d.-]/g, '')) || 0;
+            updateBalanceChip();
+          }
+          toast(res.message, 'success', 9000);
+          if (res.notice) toast(res.notice, 'info', 9000);
+        } else {
+          toast(res.message, res.pending ? 'info' : 'success', 8000);
+        }
         await renderTopup();
       } catch (err) {
         errorEl.textContent = err.message;
         submit.disabled = false;
-        submit.textContent = 'แจ้งเติมเงิน';
+        submit.textContent = topupSubmitLabel(method);
+        if (err.data && err.data.topup && err.data.status) {
+          toast(`${TOPUP_STATUS[err.data.status]?.label || err.data.status}: ${err.message}`, 'error', 9000);
+        }
       }
     });
   };
@@ -1027,7 +1165,7 @@ async function renderTopup() {
     btn.addEventListener('click', () => {
       method = btn.dataset.method;
       document.querySelectorAll('[data-method]').forEach((b) => b.classList.toggle('active', b === btn));
-      document.getElementById('topup-form-wrap').innerHTML = topupFormHtml(method);
+      document.getElementById('topup-form-wrap').innerHTML = topupFormHtml(method, pay.ticketPhone);
       renderMethod();
       bindForm();
     });
@@ -1617,15 +1755,59 @@ function currentRoute() {
   return raw.split('?')[0].replace(/\/+$/, '');
 }
 
+function pageCtx() {
+  return { state, setPage, setRoute, loader, errorState, shell };
+}
+
+/* เก็บหน้าที่เคยแสดงไว้ เพื่อกดเมนูกลับมาซ้ำแล้วขึ้นทันที ไม่ต้องรอโหลดใหม่ */
+const viewCache = new Map();
+const VIEW_CACHE_LIMIT = 6;
+
+function viewKey(path) {
+  return `${state.me ? state.me.id : 0}|${currentLocale()}|${path}`;
+}
+
+function restoreView(path) {
+  const html = viewCache.get(viewKey(path));
+  const main = document.getElementById('main-root');
+  if (!html || !main) return false;
+  main.classList.remove('page-loading');
+  main.innerHTML = html;
+  renderTopbar();
+  return true;
+}
+
+function rememberView(path) {
+  const main = document.getElementById('main-root');
+  if (!main || document.body.classList.contains('gate-open')) return;
+  if (main.querySelector('[data-loading="1"], .gate-card, .error-state')) return;
+  const key = viewKey(path);
+  viewCache.delete(key);
+  viewCache.set(key, main.innerHTML);
+  while (viewCache.size > VIEW_CACHE_LIMIT) viewCache.delete(viewCache.keys().next().value);
+}
+
 async function route() {
   const path = currentRoute();
   closeMobileMenu();
   window.scrollTo(0, 0);
+  restoreView(path);
+  await renderRoute(path);
+  // ถ้าไม่มีการเปลี่ยนเส้นทางระหว่างโหลด (เช่น เด้งไปหน้า login) จึงเก็บหน้าไว้ใช้ซ้ำ
+  if (currentRoute() === path && !document.body.classList.contains('gate-open')) rememberView(path);
+}
+
+async function renderRoute(path) {
   try {
     if (path === '') return await renderHome();
     if (path === 'login') return await renderLogin();
     if (path === 'register') return await renderRegister();
     if (path === 'topup') return await renderTopup();
+    if (path === 'wallet') return await renderWallet(pageCtx());
+    if (path === 'orders') return await renderOrders(pageCtx());
+    if (path === 'wishlist') return await renderWishlist(pageCtx());
+    if (path === 'referral') return await renderReferral(pageCtx());
+    if (path === 'status') return await renderStatus(pageCtx());
     if (path === 'account') return await renderAccount();
     if (path === 'reseller') return await renderReseller();
     if (path === 'support') return await renderSupport();
@@ -1640,7 +1822,7 @@ async function route() {
         location.hash = '#/';
         return;
       }
-      const { renderAdmin } = await import('./admin.js?v=11');
+      const { renderAdmin } = await import('./admin.js?v=21');
       return await renderAdmin({ app, state, shell, setPage, refreshMe, updateBalanceChip, loader, errorState });
     }
     return await renderHome();
@@ -1661,6 +1843,16 @@ onUnauthorized(() => {
 });
 
 document.addEventListener('click', async (event) => {
+  const langBtn = event.target.closest('[data-lang]');
+  if (langBtn) {
+    const code = langBtn.dataset.lang;
+    if (code && code !== currentLocale()) {
+      await setLocale(code);
+      await route();
+    }
+    return;
+  }
+
   const copyBtn = event.target.closest('[data-copy]');
   if (copyBtn) {
     await copyText(copyBtn.dataset.copy);
@@ -1672,6 +1864,25 @@ document.addEventListener('click', async (event) => {
     state.filter.category = Number(catBtn.dataset.cat);
     document.querySelectorAll('[data-cat]').forEach((b) => b.classList.toggle('active', b === catBtn));
     paintProducts();
+    return;
+  }
+
+  const wishBtn = event.target.closest('[data-wish]');
+  if (wishBtn) {
+    if (!state.me) {
+      toast('กรุณาเข้าสู่ระบบก่อนบันทึกสินค้าที่สนใจ', 'info');
+      location.hash = '#/login';
+      return;
+    }
+    wishBtn.disabled = true;
+    try {
+      const res = await api('/wishlist', { method: 'POST', body: { productId: Number(wishBtn.dataset.wish) } });
+      toast(res.message || 'บันทึกแล้ว', res.already ? 'info' : 'success');
+      wishBtn.textContent = '♥';
+    } catch (err) {
+      toast(err.message, 'error');
+      wishBtn.disabled = false;
+    }
     return;
   }
 
@@ -1961,9 +2172,11 @@ document.addEventListener('dragstart', (event) => {
   if (event.target && event.target.tagName === 'IMG') event.preventDefault();
 });
 
+let bootTries = 0;
+
 async function boot() {
   app.innerHTML = `<div class="boot-screen"><div class="loader"><div class="spinner"></div></div></div>`;
-  // เน็ตมือถือหลุดชั่วคราวไม่ควรทำให้ทั้งเว็บกลายเป็นหน้า error ทันที — ลองซ้ำก่อน
+  // เน็ตมือถือหลุดชั่วคราว / เซิร์ฟเวอร์กำลังอัปเดต ไม่ควรทำให้ทั้งเว็บกลายเป็นหน้า error ค้าง
   let configError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -1972,18 +2185,21 @@ async function boot() {
       break;
     } catch (err) {
       configError = err;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
     }
   }
   if (configError) {
+    bootTries += 1;
     const waitSec = Number((configError.data && configError.data.retryAfter) || 0);
-    app.innerHTML = errorState(configError.message, { retry: true });
-    // ถูกจำกัดความถี่/ระงับชั่วคราว → ลองเชื่อมต่อใหม่เองเมื่อพ้นเวลา
-    if (configError.status === 429 && waitSec > 0) {
-      setTimeout(boot, Math.min(waitSec, 30) * 1000);
-    }
+    const delay = Math.min(Math.max(waitSec || 3, 2), 30);
+    const auto = bootTries <= 20;
+    const code = configError.status ? ` (รหัส ${configError.status})` : '';
+    app.innerHTML = errorState(`${configError.message}${code}`, { retry: true, auto });
+    // ลองเชื่อมต่อใหม่เองไปเรื่อย ๆ จนกว่าเว็บจะกลับมา — ผู้ใช้ไม่ต้องกดซ้ำ
+    if (auto) setTimeout(boot, delay * 1000);
     return;
   }
+  bootTries = 0;
 
   let verified = false;
   if (gateLocalValid()) {
@@ -1998,6 +2214,7 @@ async function boot() {
     return;
   }
 
+  await initI18n();
   await refreshMe();
   await route();
   startLive();

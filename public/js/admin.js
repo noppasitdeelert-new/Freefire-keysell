@@ -8,9 +8,10 @@ import {
   statusPill,
   roleBadge,
   formatDate,
-} from './api.js?v=8';
+} from './api.js?v=19';
+import { ULTIMATE_TABS, isUltimateTab, renderUltimateTab, resetPermsCache } from './admin-ultimate.js?v=20';
 
-const TABS = [
+const BASE_TABS = [
   ['overview', 'ภาพรวม'],
   ['topups', 'เติมเงิน'],
   ['coupons', 'คูปอง'],
@@ -22,6 +23,12 @@ const TABS = [
   ['settings', 'ตั้งค่าธรรมเนียม/บัญชี'],
   ['logs', 'ประวัติการใช้งาน'],
 ];
+
+const TABS = [...BASE_TABS, ...ULTIMATE_TABS];
+
+function canSeeTab(tab) {
+  return TABS.some(([key]) => key === tab);
+}
 
 function parseTab() {
   const raw = location.hash.split('?')[1] || '';
@@ -60,7 +67,7 @@ function errorCard(message) {
 async function overviewTab(body, ctx, silent = false) {
   if (!silent) body.innerHTML = spinner();
   const data = await api('/admin/overview');
-  const roleRows = ['owner', 'admin', 'dealer', 'member']
+  const roleRows = Object.keys(data.roles || {})
     .map(
       (key) => `<div class="kv"><span>${roleBadge(key, key === 'dealer' ? 'ตัวแทน/ตัวขาย' : key)}</span><span>${data.roles[key] || 0} คน</span></div>`,
     )
@@ -1315,6 +1322,7 @@ async function loadTab(tab, ctx) {
     else if (tab === 'tickets') await ticketsTab(body);
     else if (tab === 'settings') await settingsTab(body, ctx);
     else if (tab === 'logs') await logsTab(body);
+    else if (isUltimateTab(tab)) await renderUltimateTab(tab, body);
   } catch (err) {
     body.innerHTML = errorCard(err.message);
   }
@@ -1323,6 +1331,7 @@ async function loadTab(tab, ctx) {
 export async function renderAdmin(ctx) {
   const { state, setPage, shell } = ctx;
   activeCtx = ctx;
+  resetPermsCache();
   const tab = parseTab();
   const html = `
     <div class="page">
