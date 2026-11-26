@@ -9,7 +9,7 @@ import {
   roleBadge,
   formatDate,
   onUnauthorized,
-} from './api.js?v=10';
+} from './api.js?v=11';
 import { mountCaptcha, captchaPayload } from './captcha.js';
 
 const app = document.getElementById('app');
@@ -189,11 +189,12 @@ function loader() {
   return `<div class="page"><div class="loader"><div class="spinner"></div></div></div>`;
 }
 
-function errorState(message) {
+function errorState(message, { retry = false } = {}) {
   return `<div class="page"><div class="card center" style="max-width:440px;margin:60px auto">
     <h3>เกิดข้อผิดพลาด</h3>
     <p class="muted small" style="margin:8px 0 18px">${escapeHtml(message)}</p>
-    <a class="btn btn-primary" href="#/">กลับหน้าแรก</a>
+    ${retry ? '<button class="btn btn-primary" type="button" data-retry>ลองใหม่อีกครั้ง</button>' : '<a class="btn btn-primary" href="#/">กลับหน้าแรก</a>'}
+    <p class="tiny muted" style="margin-top:12px">ถ้ายังขึ้นซ้ำ ลองปิดแล้วเปิดหน้าเว็บใหม่ หรือรอสักครู่แล้วกดลองใหม่</p>
   </div></div>`;
 }
 
@@ -1639,7 +1640,7 @@ async function route() {
         location.hash = '#/';
         return;
       }
-      const { renderAdmin } = await import('./admin.js?v=10');
+      const { renderAdmin } = await import('./admin.js?v=11');
       return await renderAdmin({ app, state, shell, setPage, refreshMe, updateBalanceChip, loader, errorState });
     }
     return await renderHome();
@@ -1942,6 +1943,13 @@ document.addEventListener('keydown', (event) => {
   toast('เนื้อหาเว็บนี้ได้รับการคุ้มครอง — ห้ามบันทึกหรือคัดลอกทั้งเว็บไซต์', 'error', 3200);
 });
 
+document.addEventListener('click', (event) => {
+  const retry = event.target.closest('[data-retry]');
+  if (!retry) return;
+  event.preventDefault();
+  window.location.reload();
+});
+
 document.addEventListener('contextmenu', (event) => {
   if (event.target.closest('img, .hero, .product-card, .gate-card, .brand-mark')) {
     event.preventDefault();
@@ -1955,10 +1963,25 @@ document.addEventListener('dragstart', (event) => {
 
 async function boot() {
   app.innerHTML = `<div class="boot-screen"><div class="loader"><div class="spinner"></div></div></div>`;
-  try {
-    state.config = await api('/config');
-  } catch (err) {
-    app.innerHTML = errorState(err.message);
+  // เน็ตมือถือหลุดชั่วคราวไม่ควรทำให้ทั้งเว็บกลายเป็นหน้า error ทันที — ลองซ้ำก่อน
+  let configError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      state.config = await api('/config');
+      configError = null;
+      break;
+    } catch (err) {
+      configError = err;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+    }
+  }
+  if (configError) {
+    const waitSec = Number((configError.data && configError.data.retryAfter) || 0);
+    app.innerHTML = errorState(configError.message, { retry: true });
+    // ถูกจำกัดความถี่/ระงับชั่วคราว → ลองเชื่อมต่อใหม่เองเมื่อพ้นเวลา
+    if (configError.status === 429 && waitSec > 0) {
+      setTimeout(boot, Math.min(waitSec, 30) * 1000);
+    }
     return;
   }
 
